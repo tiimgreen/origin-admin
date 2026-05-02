@@ -1,7 +1,5 @@
 import type { ShopProfile, ShopWithRevenue } from "./insights";
 
-const META_PLATFORM_KEYS = ["facebook", "meta", "instagram"];
-
 export type Segment = {
   label: string;
   shops: Array<ShopWithRevenue>;
@@ -40,6 +38,9 @@ export const isChampion = (shop: ShopWithRevenue) => {
     return false;
   }
   if (shop.revenue90d <= 0) {
+    return false;
+  }
+  if (shop.pageviews30d <= 0) {
     return false;
   }
   return true;
@@ -197,12 +198,6 @@ const yesNo = (predicate: boolean) => {
   return predicate ? "yes" : "no";
 };
 
-const hasMeta = (shop: ShopProfile) => {
-  return shop.connectedPlatformKeys.some((k) => {
-    return META_PLATFORM_KEYS.includes(k);
-  });
-};
-
 const hasAnyAd = (shop: ShopProfile) => {
   return shop.connectedPlatformKeys.length > 0;
 };
@@ -293,30 +288,6 @@ export const computeICPScorecard = (
       classifyBaseline: (s) => orderCountBucket(s.orderCountAtInstall),
     }),
     buildDimension({
-      key: "has_meta",
-      label: "Meta connected",
-      group: "Activation",
-      bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(hasMeta(s)),
-      classifyChurner: (s) => yesNo(hasMeta(s)),
-      classifyBaseline: (s) => yesNo(hasMeta(s)),
-    }),
-    buildDimension({
-      key: "has_any_ad",
-      label: "Any ad platform connected",
-      group: "Activation",
-      bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(hasAnyAd(s)),
-      classifyChurner: (s) => yesNo(hasAnyAd(s)),
-      classifyBaseline: (s) => yesNo(hasAnyAd(s)),
-    }),
-    buildDimension({
       key: "pixel_installed",
       label: "Origin pixel installed",
       group: "Activation",
@@ -350,16 +321,16 @@ export const computeICPScorecard = (
       classifyBaseline: (s) => timeToPixelBucket(s),
     }),
     buildDimension({
-      key: "onboarded",
-      label: "Completed onboarding",
+      key: "setup_complete",
+      label: "Completed setup",
       group: "Activation",
       bucketOrder: ["yes", "no"],
       champions,
       churners,
       baseline,
-      classifyChampion: (s) => yesNo(s.hasCompletedOnboarding),
-      classifyChurner: (s) => yesNo(s.hasCompletedOnboarding),
-      classifyBaseline: (s) => yesNo(s.hasCompletedOnboarding),
+      classifyChampion: (s) => yesNo(s.hasCompletedSetup),
+      classifyChurner: (s) => yesNo(s.hasCompletedSetup),
+      classifyBaseline: (s) => yesNo(s.hasCompletedSetup),
     }),
     buildDimension({
       key: "install_source",
@@ -397,7 +368,7 @@ export const computeActivationFunnel = (
   const pixelLive = shops.filter((s) => s.originPixelAddedAt !== null).length;
   const adConnected = shops.filter((s) => hasAnyAd(s)).length;
   const firstOrder = shops.filter((s) => s.revenue90d > 0).length;
-  const onboarded = shops.filter((s) => s.hasCompletedOnboarding).length;
+  const onboarded = shops.filter((s) => s.hasCompletedSetup).length;
   const paying = shops.filter((s) => s.isPaying).length;
 
   const raw = [
@@ -405,7 +376,7 @@ export const computeActivationFunnel = (
     { label: "Pixel live", count: pixelLive },
     { label: "Ad platform connected", count: adConnected },
     { label: "First order tracked (90d)", count: firstOrder },
-    { label: "Completed onboarding", count: onboarded },
+    { label: "Completed setup", count: onboarded },
     { label: "Paying", count: paying },
   ];
 
@@ -422,8 +393,19 @@ export const computeActivationFunnel = (
 
 export type ChurnDistributionPoint = {
   bucket: string;
-  count: number;
+  [series: string]: number | string;
 };
+
+export type ChurnDistributionSeries = {
+  key: string;
+  label: string;
+  total: number;
+};
+
+export type ChurnSplitBy =
+  | "none"
+  | "install-source"
+  | "shopify-plus";
 
 const CHURN_BUCKETS: Array<{ label: string; min: number; max: number | null }> = [
   { label: "<1d", min: 0, max: 1 },
@@ -436,15 +418,51 @@ const CHURN_BUCKETS: Array<{ label: string; min: number; max: number | null }> =
   { label: "180d+", min: 180, max: null },
 ];
 
-export const computeChurnDistribution = (
-  shops: Array<ShopProfile>,
-): Array<ChurnDistributionPoint> => {
+const ORDER_FOR_SPLIT: Record<ChurnSplitBy, Array<string>> = {
+  "none": ["all"],
+  "install-source": ["Meta ad click", "Google ad click", "organic / direct"],
+  "shopify-plus": ["yes", "no"],
+};
+
+const seriesKeyFor = (params: {
+  shop: ShopWithRevenue;
+  splitBy: ChurnSplitBy;
+}): string => {
+  const { shop, splitBy } = params;
+  if (splitBy === "none") {
+    return "all";
+  }
+  if (splitBy === "install-source") {
+    return installSource(shop);
+  }
+  return yesNo(shop.shopifyPlus);
+};
+
+export type ChurnDistributionResult = {
+  data: Array<ChurnDistributionPoint>;
+  series: Array<ChurnDistributionSeries>;
+};
+
+export const computeChurnDistribution = (params: {
+  shops: Array<ShopWithRevenue>;
+  splitBy?: ChurnSplitBy;
+}): ChurnDistributionResult => {
+  const splitBy = params.splitBy ?? "none";
+  const seriesOrder = ORDER_FOR_SPLIT[splitBy];
+
   const buckets = new Map<string, ChurnDistributionPoint>();
   for (const bucket of CHURN_BUCKETS) {
-    buckets.set(bucket.label, { bucket: bucket.label, count: 0 });
+    const point: ChurnDistributionPoint = { bucket: bucket.label };
+    for (const key of seriesOrder) {
+      point[key] = 0;
+    }
+    buckets.set(bucket.label, point);
   }
 
-  for (const shop of shops) {
+  const totals = new Map<string, number>();
+  const observedKeys = new Set<string>();
+
+  for (const shop of params.shops) {
     const days = installToUninstallDays(shop);
     if (days === null || days < 0) {
       continue;
@@ -456,12 +474,70 @@ export const computeChurnDistribution = (
       continue;
     }
     const point = buckets.get(bucket.label);
-    if (point) {
-      point.count += 1;
+    if (!point) {
+      continue;
+    }
+
+    const seriesKey = seriesKeyFor({ shop, splitBy });
+    observedKeys.add(seriesKey);
+    point[seriesKey] = ((point[seriesKey] as number | undefined) ?? 0) + 1;
+    totals.set(seriesKey, (totals.get(seriesKey) ?? 0) + 1);
+  }
+
+  const orderedKeys = Array.from(
+    new Set([...seriesOrder, ...Array.from(observedKeys)]),
+  );
+
+  for (const point of buckets.values()) {
+    for (const key of orderedKeys) {
+      if (point[key] === undefined) {
+        point[key] = 0;
+      }
     }
   }
 
-  return Array.from(buckets.values());
+  const series: Array<ChurnDistributionSeries> = orderedKeys.map((key) => {
+    return {
+      key,
+      label: key,
+      total: totals.get(key) ?? 0,
+    };
+  });
+
+  return {
+    data: Array.from(buckets.values()),
+    series,
+  };
+};
+
+export type ChurnTypeBreakdown = {
+  neverActivated: number;
+  gotValue: number;
+  total: number;
+};
+
+export const computeChurnTypeBreakdown = (
+  shops: Array<ShopWithRevenue>,
+): ChurnTypeBreakdown => {
+  const churned = shops.filter((s) => {
+    return !s.isInstalled && s.uninstalledAt !== null;
+  });
+
+  let neverActivated = 0;
+  let gotValue = 0;
+  for (const shop of churned) {
+    if (shop.originPixelAddedAt === null && shop.revenue90d === 0) {
+      neverActivated += 1;
+    } else {
+      gotValue += 1;
+    }
+  }
+
+  return {
+    neverActivated,
+    gotValue,
+    total: churned.length,
+  };
 };
 
 export type AcquisitionRow = {

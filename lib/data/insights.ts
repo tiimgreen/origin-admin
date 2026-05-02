@@ -3,6 +3,7 @@ import { cache } from "react";
 import { supabase } from "@/lib/supabase";
 import { tinybirdQuery } from "@/lib/tinybird";
 
+import type { ShopActivityRow } from "./activity";
 import { fxToUsdSql } from "./currencies";
 
 export type ShopRevenueRow = {
@@ -63,9 +64,10 @@ export type ShopProfile = {
   name: string | null;
   currency: string;
   plan: string | null;
+  subscriptionPrice: number | null;
   isPaying: boolean;
   isInstalled: boolean;
-  hasCompletedOnboarding: boolean;
+  hasCompletedSetup: boolean;
   initialInstalledAt: string | null;
   lastInstalledAt: string | null;
   uninstalledAt: string | null;
@@ -95,29 +97,34 @@ const parseShopData = (raw: unknown): RawShopData | null => {
 };
 
 export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
-  const [shopsResult, connectionsResult, subscriptionsResult] = await Promise.all([
-    supabase
-      .from("shops")
-      .select(`
-        shop,
-        name,
-        currency_code,
-        isInstalled,
-        has_completed_onboarding,
-        initialInstalledAt,
-        lastInstalledAt,
-        uninstalled_at,
-        origin_pixel_added,
-        order_count_at_install,
-        app_install_fbclid,
-        app_install_gclid,
-        plan_public_display_name,
-        shopify_plus,
-        is_partner_development_plan,
-        shopData,
-        currently_active_subscription_id
-      `)
-      .limit(10000),
+  const shopsPromise = supabase
+    .from("shops")
+    .select(`
+      shop,
+      name,
+      currency_code,
+      isInstalled,
+      initialInstalledAt,
+      lastInstalledAt,
+      uninstalled_at,
+      origin_pixel_added,
+      order_count_at_install,
+      app_install_fbclid,
+      app_install_gclid,
+      plan_public_display_name,
+      shopify_plus,
+      is_partner_development_plan,
+      shopData,
+      currently_active_subscription_id
+    `)
+    .limit(3000);
+
+  const [
+    { data: shops, error: shopsError },
+    connectionsResult,
+    subscriptionsResult
+  ] = await Promise.all([
+    shopsPromise,
     supabase
       .from("connected_platforms")
       .select(`
@@ -133,14 +140,16 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       .select(`
         id,
         plan_key,
-        status
+        price,
+        status,
+        has_completed_setup
       `)
       .limit(20000),
   ]);
 
-  if (shopsResult.error) {
-    console.error("Error fetching shops", shopsResult.error);
-    throw shopsResult.error;
+  if (shopsError) {
+    console.error("Error fetching shops", shopsError);
+    throw shopsError;
   }
   if (connectionsResult.error) {
     console.error("Error fetching connections", connectionsResult.error);
@@ -166,16 +175,23 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
 
   const subscriptionsById = new Map<
     number,
-    { plan_key: string; status: string }
+    {
+      plan_key: string;
+      price: number | null;
+      status: string;
+      has_completed_setup: boolean;
+    }
   >();
   for (const sub of subscriptionsResult.data ?? []) {
     subscriptionsById.set(sub.id, {
       plan_key: sub.plan_key,
+      price: sub.price,
       status: sub.status,
+      has_completed_setup: sub.has_completed_setup,
     });
   }
 
-  return (shopsResult.data ?? []).map((shop) => {
+  return shops.map((shop) => {
     const sub = shop.currently_active_subscription_id
       ? subscriptionsById.get(shop.currently_active_subscription_id)
       : null;
@@ -186,9 +202,10 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       name: shop.name ?? null,
       currency: shop.currency_code,
       plan: sub?.plan_key ?? null,
+      subscriptionPrice: sub?.price ?? null,
       isPaying: sub?.status === "ACTIVE",
       isInstalled: shop.isInstalled === true,
-      hasCompletedOnboarding: shop.has_completed_onboarding,
+      hasCompletedSetup: sub?.has_completed_setup === true,
       initialInstalledAt: shop.initialInstalledAt,
       lastInstalledAt: shop.lastInstalledAt,
       uninstalledAt: shop.uninstalled_at,
@@ -243,22 +260,29 @@ export type RevenueHistogramPoint = {
 export type ShopWithRevenue = ShopProfile & {
   monthlyAvgRevenue: number;
   revenue90d: number;
+  pageviews30d: number;
+  lastSeenAt: string | null;
 };
 
 export const joinShopsWithRevenue = (
   shops: Array<ShopProfile>,
   revenue: Array<ShopRevenueRow>,
+  activity: Array<ShopActivityRow> = [],
 ): Array<ShopWithRevenue> => {
   const revenueByShop = new Map(revenue.map((r) => [r.shop, r]));
+  const activityByShop = new Map(activity.map((a) => [a.shop, a]));
 
   return shops
     .filter((s) => s.isInstalled)
     .map((shop) => {
       const r = revenueByShop.get(shop.shop);
+      const a = activityByShop.get(shop.shop);
       return {
         ...shop,
         monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
         revenue90d: r?.revenue90d ?? 0,
+        pageviews30d: a?.pageviews30d ?? 0,
+        lastSeenAt: a?.lastSeenAt ?? null,
       };
     });
 };
@@ -266,15 +290,20 @@ export const joinShopsWithRevenue = (
 export const joinAllShopsWithRevenue = (
   shops: Array<ShopProfile>,
   revenue: Array<ShopRevenueRow>,
+  activity: Array<ShopActivityRow> = [],
 ): Array<ShopWithRevenue> => {
   const revenueByShop = new Map(revenue.map((r) => [r.shop, r]));
+  const activityByShop = new Map(activity.map((a) => [a.shop, a]));
 
   return shops.map((shop) => {
     const r = revenueByShop.get(shop.shop);
+    const a = activityByShop.get(shop.shop);
     return {
       ...shop,
       monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
       revenue90d: r?.revenue90d ?? 0,
+      pageviews30d: a?.pageviews30d ?? 0,
+      lastSeenAt: a?.lastSeenAt ?? null,
     };
   });
 };
@@ -365,7 +394,7 @@ export const computeFunnel = (
   shops: Array<ShopWithRevenue>,
 ): Array<FunnelStep> => {
   const installed = shops.length;
-  const onboarded = shops.filter((s) => s.hasCompletedOnboarding).length;
+  const onboarded = shops.filter((s) => s.hasCompletedSetup).length;
   const withAdAccount = shops.filter((s) => s.connectedPlatformKeys.length > 0).length;
   const paying = shops.filter((s) => s.isPaying).length;
   const recentlyActive = shops.filter((s) => s.revenue90d > 0).length;

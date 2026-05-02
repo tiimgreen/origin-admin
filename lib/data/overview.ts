@@ -162,7 +162,7 @@ export type ShopCounts = {
   installedLast30: number;
   installedPrev30: number;
   paying: number;
-  onboardingComplete: number;
+  setupComplete: number;
 };
 
 export const getShopCounts = cache(async (): Promise<ShopCounts> => {
@@ -177,7 +177,7 @@ export const getShopCounts = cache(async (): Promise<ShopCounts> => {
     installedLast30Res,
     installedPrev30Res,
     payingRes,
-    onboardingCompleteRes,
+    setupCompleteRes,
   ] = await Promise.all([
     supabase.from("shops").select("*", { count: "exact", head: true }),
     supabase
@@ -204,10 +204,9 @@ export const getShopCounts = cache(async (): Promise<ShopCounts> => {
       .select("*", { count: "exact", head: true })
       .eq("status", "ACTIVE"),
     supabase
-      .from("shops")
+      .from("subscriptions")
       .select("*", { count: "exact", head: true })
-      .eq("isInstalled", true)
-      .eq("has_completed_onboarding", true),
+      .eq("has_completed_setup", true),
   ]);
 
   for (const res of [
@@ -217,7 +216,7 @@ export const getShopCounts = cache(async (): Promise<ShopCounts> => {
     installedLast30Res,
     installedPrev30Res,
     payingRes,
-    onboardingCompleteRes,
+    setupCompleteRes,
   ]) {
     if (res.error) {
       console.error("Error fetching shop counts", res.error);
@@ -232,7 +231,7 @@ export const getShopCounts = cache(async (): Promise<ShopCounts> => {
     installedLast30: installedLast30Res.count ?? 0,
     installedPrev30: installedPrev30Res.count ?? 0,
     paying: payingRes.count ?? 0,
-    onboardingComplete: onboardingCompleteRes.count ?? 0,
+    setupComplete: setupCompleteRes.count ?? 0,
   };
 });
 

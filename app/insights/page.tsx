@@ -1,4 +1,5 @@
 import { Suspense } from "react";
+import Link from "next/link";
 import { Compass, Globe, Layers, PiggyBank, Target, Users } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,27 +35,49 @@ import {
   joinShopsWithRevenue,
 } from "@/lib/data/insights";
 import {
+  ACTIVE_PAGEVIEW_WINDOW_DAYS,
+  getShopActivity,
+} from "@/lib/data/activity";
+import {
   computeAcquisitionBreakdown,
   computeActivationFunnel,
   computeChurnDistribution,
+  computeChurnTypeBreakdown,
   computeICPScorecard,
+  type ChurnSplitBy,
 } from "@/lib/data/icp";
 import { FX_AS_OF } from "@/lib/data/currencies";
+import { cn } from "@/lib/utils";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
-const CHAMPION_DEFINITION = "tenure ≥ 90d, paying, revenue in last 90d";
+const CHAMPION_DEFINITION = "tenure ≥ 90d, paying, revenue in last 90d, active in app last 30d";
 const CHURNER_DEFINITION = "uninstalled within 30d of install";
+
+const CHURN_SPLIT_OPTIONS: Array<{ key: ChurnSplitBy; label: string }> = [
+  { key: "none", label: "All" },
+  { key: "install-source", label: "By source" },
+  { key: "shopify-plus", label: "By Plus" },
+];
+
+const isChurnSplit = (value: string | undefined): value is ChurnSplitBy => {
+  return CHURN_SPLIT_OPTIONS.some((opt) => opt.key === value);
+};
 
 export const dynamic = "force-dynamic";
 
-const InsightsBoard = async () => {
-  const [shops, revenue] = await Promise.all([
+type InsightsBoardProps = {
+  churnSplit: ChurnSplitBy;
+};
+
+const InsightsBoard = async ({ churnSplit }: InsightsBoardProps) => {
+  const [shops, revenue, activity] = await Promise.all([
     getShopProfiles(),
     getShopRevenue90d(),
+    getShopActivity(),
   ]);
 
-  const joined = joinShopsWithRevenue(shops, revenue);
-  const allWithRevenue = joinAllShopsWithRevenue(shops, revenue);
+  const joined = joinShopsWithRevenue(shops, revenue, activity);
+  const allWithRevenue = joinAllShopsWithRevenue(shops, revenue, activity);
   const histogram = computeRevenueHistogram(joined);
   const adMatrix = computeAdConnectionMatrix(joined);
   const planBreakdown = computePlanBreakdown(joined);
@@ -63,10 +86,14 @@ const InsightsBoard = async () => {
   const platformAdoption = computePlatformAdoption(joined);
   const scorecard = computeICPScorecard(allWithRevenue);
   const activationFunnel = computeActivationFunnel(joined);
-  const churnDistribution = computeChurnDistribution(allWithRevenue);
+  const churnDistribution = computeChurnDistribution({
+    shops: allWithRevenue,
+    splitBy: churnSplit,
+  });
+  const churnTypes = computeChurnTypeBreakdown(allWithRevenue);
   const acquisition = computeAcquisitionBreakdown(allWithRevenue, allWithRevenue);
 
-  const totalActiveShops = joined.filter((s) => s.revenue90d > 0).length;
+  const totalActiveShops = joined.filter((s) => s.pageviews30d > 0).length;
   const totalRevenue90d = joined.reduce((sum, s) => sum + s.revenue90d, 0);
   const medianRevenue = (() => {
     const active = joined
@@ -87,11 +114,11 @@ const InsightsBoard = async () => {
     <>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <KpiCard
-          label="Active shops (90d)"
+          label={`Active shops (${ACTIVE_PAGEVIEW_WINDOW_DAYS}d)`}
           value={formatNumber({ value: totalActiveShops })}
           hint={
             joined.length > 0
-              ? `${formatPercent(totalActiveShops / joined.length)} of installed`
+              ? `${formatPercent(totalActiveShops / joined.length)} of installed · visited app`
               : undefined
           }
           icon={Users}
@@ -196,16 +223,79 @@ const InsightsBoard = async () => {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle className="text-base font-semibold text-foreground">
-              Days from install to uninstall
-            </CardTitle>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Distribution of all uninstalls · early-churn buckets highlighted in red
-            </p>
+          <CardHeader className="flex flex-row items-start justify-between space-y-0">
+            <div>
+              <CardTitle className="text-base font-semibold text-foreground">
+                Days from install to uninstall
+              </CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Distribution of all uninstalls · split by selected dimension
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-1 rounded-md border bg-muted p-1">
+              {CHURN_SPLIT_OPTIONS.map((option) => {
+                const isActive = option.key === churnSplit;
+                const href =
+                  option.key === "none"
+                    ? "/insights"
+                    : `/insights?churn=${option.key}`;
+                return (
+                  <Link
+                    key={option.key}
+                    href={href}
+                    scroll={false}
+                    className={cn(
+                      "rounded px-2 py-1 text-[10px] font-medium transition-colors",
+                      isActive
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    {option.label}
+                  </Link>
+                );
+              })}
+            </div>
           </CardHeader>
           <CardContent className="pt-0">
-            <ChurnDistributionChart data={churnDistribution} />
+            <ChurnDistributionChart
+              data={churnDistribution.data}
+              series={churnDistribution.series}
+            />
+            <div className="mt-4 grid grid-cols-2 gap-3 border-t pt-4">
+              <div className="rounded-md border bg-muted/30 p-3">
+                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Never activated
+                </div>
+                <div className="mt-1 text-2xl font-semibold tabular-nums">
+                  {formatNumber({ value: churnTypes.neverActivated })}
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  uninstalled, no pixel & no revenue ·{" "}
+                  {churnTypes.total > 0
+                    ? formatPercent(
+                        churnTypes.neverActivated / churnTypes.total,
+                      )
+                    : "—"}{" "}
+                  of churn
+                </div>
+              </div>
+              <div className="rounded-md border bg-muted/30 p-3">
+                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Got value, then left
+                </div>
+                <div className="mt-1 text-2xl font-semibold tabular-nums">
+                  {formatNumber({ value: churnTypes.gotValue })}
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  pixel installed or had revenue ·{" "}
+                  {churnTypes.total > 0
+                    ? formatPercent(churnTypes.gotValue / churnTypes.total)
+                    : "—"}{" "}
+                  of churn
+                </div>
+              </div>
+            </div>
           </CardContent>
         </Card>
 
@@ -538,7 +628,16 @@ const InsightsSkeleton = () => {
   );
 };
 
-export default function InsightsPage() {
+type InsightsPageProps = {
+  searchParams: Promise<{ churn?: string }>;
+};
+
+export default async function InsightsPage({ searchParams }: InsightsPageProps) {
+  const params = await searchParams;
+  const churnSplit: ChurnSplitBy = isChurnSplit(params.churn)
+    ? params.churn
+    : "none";
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -558,8 +657,8 @@ export default function InsightsPage() {
         }
       />
 
-      <Suspense fallback={<InsightsSkeleton />}>
-        <InsightsBoard />
+      <Suspense key={churnSplit} fallback={<InsightsSkeleton />}>
+        <InsightsBoard churnSplit={churnSplit} />
       </Suspense>
 
       <Separator />
@@ -567,6 +666,11 @@ export default function InsightsPage() {
         Revenue figures convert each shop&apos;s native currency to USD at fixed mid-market rates
         as of {FX_AS_OF}. Rates are hard-coded for reporting only — not exact, but better than
         excluding non-USD shops. Currencies outside the table fall back to a 1:1 rate.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        On uninstall we delete all shop data except the <code className="text-[10px]">shops</code> row and{" "}
+        <code className="text-[10px]">subscriptions</code> records. Activation signals that depend on deleted tables
+        (ad accounts, order revenue) are not shown for churned shops in the comparisons above.
       </p>
     </div>
   );

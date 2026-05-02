@@ -72,6 +72,46 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 This will server as an admin dashboard for my order attribution shopify app, Origin.
 
+## Data sources
+
+The dashboard fans out to three systems. Each lives behind its own client in `lib/`.
+
+- **Supabase (OLTP)** — `lib/supabase.ts`. Source of truth for shops, subscriptions, connected ad platforms, etc. Generated types in `types/database.types.ts` (do not edit). The main app at `/Users/tim/code/origin-utm-tracking` writes to this database; we only read.
+- **Tinybird (analytics)** — `lib/tinybird.ts`. CDC replica of the OLTP data plus order/ad-spend tables. We use it for revenue aggregations (e.g. 90-day GMV, revenue trend) and any per-shop metric that would be too slow to compute against Supabase. Queries are HogQL-flavoured ClickHouse SQL via the `/v0/sql` endpoint. Currency conversion uses `fxToUsdSql` in `lib/data/currencies.ts` (fixed mid-market rates as of `FX_AS_OF`).
+- **PostHog (product analytics)** — `lib/posthog.ts`. Source of truth for in-app activity. The main app calls `posthog.identify(shop)` on every page render, so `distinct_id` for any `$pageview` event equals the `*.myshopify.com` shop URL. We query via the HogQL endpoint (`/api/projects/:id/query/`) and always filter to distinct_ids ending in `.myshopify.com` to drop pre-identify anonymous events.
+
+Caching: every cross-system fetcher in `lib/data/` is wrapped in React's `cache()` so a single page render makes one round trip per data source even when multiple components consume it.
+
+## Activity & engagement model
+
+Activity-based signals come from PostHog `$pageview` events and live in `lib/data/activity.ts`. There are two fetchers:
+
+- `getShopActivity()` — last 30 days. Returns `{ shop, pageviews30d, lastSeenAt }`. Window length is `ACTIVE_PAGEVIEW_WINDOW_DAYS`.
+- `getShopMonthlyActivity()` — last 18 months, bucketed by calendar month. Returns `{ shop, activeMonths: Set<"YYYY-MM"> }`. Window length is `MONTHLY_ACTIVITY_WINDOW_MONTHS` and matches `COHORT_MONTHS` in `cohorts.ts` so the retention chart has full coverage.
+
+`ShopWithRevenue` (in `lib/data/insights.ts`) carries `pageviews30d` and `lastSeenAt`. Both join helpers (`joinShopsWithRevenue`, `joinAllShopsWithRevenue`) accept an optional `activity` array and default the fields to 0/null when omitted.
+
+### Metric definitions
+
+These definitions live in code, but documenting them here prevents silent drift when reading the UI:
+
+- **Active shop (last 30d)** — `pageviews30d > 0`. Surfaced as the "Active shops (30d)" KPI on `/insights`.
+- **Engagement tier** (`lib/data/health.ts`) — `high` if `pageviews30d > 0`, else `low`. Drives the customer-health matrix on `/lifecycle` (Champions / Upsell candidates / At-risk / Churn candidates). Pre-Apr 2026 this was a 3-signal score (revenue + pixel + ad platform); it was replaced because pixel/ad-platform are install-time signals, not usage signals.
+- **Champion** (`lib/data/icp.ts:isChampion`) — installed AND paying AND tenure ≥ 90d AND `revenue90d > 0` AND `pageviews30d > 0`. The activity check is what stops a shop that paid once a year ago and never came back from being labelled a champion.
+- **Plan tier** (`lib/data/health.ts`) — `paid` if `isPaying && plan ∈ {standard, pro, platinum}`, else `free`.
+- **Cohort retention** (`lib/data/cohorts.ts`) — cohort = install month. A shop is "retained in month N" iff it fired ≥1 `$pageview` in the calendar month that is N months after its install month. Crucially this is *not* "still installed" — shops that stay installed but stop using the app drop off the curve. Cohort size still comes from installs, so percentages are comparable across rows.
+
+### Where to look for what
+
+| Concern | File |
+|---------|------|
+| Active / engagement / pageview signal | `lib/data/activity.ts` |
+| Shop profile + revenue join | `lib/data/insights.ts` |
+| Champion / ICP scorecard / churn classification | `lib/data/icp.ts` |
+| Health matrix (plan tier × engagement tier) | `lib/data/health.ts` |
+| Cohort retention | `lib/data/cohorts.ts` |
+| MRR movement | `lib/data/mrr.ts` |
+
 ## Writing code
 
 Ensure code is clean and always follows the style of the existing code.

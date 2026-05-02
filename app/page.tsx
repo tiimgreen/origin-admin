@@ -112,11 +112,11 @@ const KpiRow = async () => {
         icon={DollarSign}
       />
       <KpiCard
-        label="Onboarded shops"
-        value={formatNumber({ value: shops.onboardingComplete })}
+        label="Set-up shops"
+        value={formatNumber({ value: shops.setupComplete })}
         hint={
           shops.installed > 0
-            ? `${formatPercent(shops.onboardingComplete / shops.installed)} of installed`
+            ? `${formatPercent(shops.setupComplete / shops.installed)} of installed`
             : undefined
         }
         icon={Sparkles}
