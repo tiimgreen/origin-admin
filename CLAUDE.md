@@ -86,30 +86,31 @@ Caching: every cross-system fetcher in `lib/data/` is wrapped in React's `cache(
 
 Activity-based signals come from PostHog `$pageview` events and live in `lib/data/activity.ts`. There are two fetchers:
 
-- `getShopActivity()` — last 30 days. Returns `{ shop, pageviews30d, lastSeenAt }`. Window length is `ACTIVE_PAGEVIEW_WINDOW_DAYS`.
-- `getShopMonthlyActivity()` — last 18 months, bucketed by calendar month. Returns `{ shop, activeMonths: Set<"YYYY-MM"> }`. Window length is `MONTHLY_ACTIVITY_WINDOW_MONTHS` and matches `COHORT_MONTHS` in `cohorts.ts` so the retention chart has full coverage.
+- `getShopActivity()` — pulls the last 30 days. Returns `{ shop, pageviews14d, reportPageviews14d, pageviews30d, lastSeenAt }`. Two windows in one query: 14d (active / super-active) + 30d (legacy engagement tier). `ACTIVE_PAGEVIEW_WINDOW_DAYS = 14`. A "report pageview" is any `$pageview` whose `$pathname` does NOT start with `/settings` or `/utm-notepad` — those paths are admin/UI surfaces, not value-bearing report views.
+- `getShopMonthlyActivity()` — last 18 months, bucketed by calendar month. Returns `{ shop, activeMonths, superActiveMonths }`. A month is in `superActiveMonths` if the shop had ≥`SUPER_ACTIVE_PAGEVIEW_THRESHOLD` (= 3) report pageviews in that month. Window length is `MONTHLY_ACTIVITY_WINDOW_MONTHS` and matches `COHORT_MONTHS` in `cohorts.ts` so the retention chart has full coverage.
 
-`ShopWithRevenue` (in `lib/data/insights.ts`) carries `pageviews30d` and `lastSeenAt`. Both join helpers (`joinShopsWithRevenue`, `joinAllShopsWithRevenue`) accept an optional `activity` array and default the fields to 0/null when omitted.
+`ShopWithRevenue` (in `lib/data/insights.ts`) carries `pageviews14d`, `reportPageviews14d`, `pageviews30d`, `lastSeenAt`, and `firstPaidAt` (the earliest `activated_at` of any subscription with `price > 0`). Both join helpers (`joinShopsWithRevenue`, `joinAllShopsWithRevenue`) accept an optional `activity` array and default the fields to 0/null when omitted.
 
 ### Metric definitions
 
 These definitions live in code, but documenting them here prevents silent drift when reading the UI:
 
-- **Active shop (last 30d)** — `pageviews30d > 0`. Surfaced as the "Active shops (30d)" KPI on `/insights`.
-- **Engagement tier** (`lib/data/health.ts`) — `high` if `pageviews30d > 0`, else `low`. Drives the customer-health matrix on `/lifecycle` (Champions / Upsell candidates / At-risk / Churn candidates). Pre-Apr 2026 this was a 3-signal score (revenue + pixel + ad platform); it was replaced because pixel/ad-platform are install-time signals, not usage signals.
-- **Champion** (`lib/data/icp.ts:isChampion`) — installed AND paying AND tenure ≥ 90d AND `revenue90d > 0` AND `pageviews30d > 0`. The activity check is what stops a shop that paid once a year ago and never came back from being labelled a champion.
+- **Active** (`lib/data/activity.ts:isActive`) — `pageviews14d > 0` AND `lastSeenAt >= firstPaidAt`. The post-`firstPaidAt` check is the whole point: the metric measures shops that have meaningfully used the app *after* paying. Surfaced as the "Active shops (14d)" KPI on `/insights` and as one of the cohort retention charts.
+- **Super-active** (`lib/data/activity.ts:isSuperActive`) — `reportPageviews14d >= 3` AND `lastSeenAt >= firstPaidAt`. Same post-subscribe gate, but tightens the bar to ≥3 *report* pageviews (excludes `/settings` and `/utm-notepad`) — a shop only counts if it's actually been checking metrics, which is how you get value from Origin. Surfaced as the "Super-active (14d)" KPI on `/insights`, as the second cohort retention chart, and as the activity check inside the Champion definition.
+- **Engagement tier** (`lib/data/health.ts`) — `high` if `pageviews30d > 0`, else `low`. Drives the customer-health matrix on `/lifecycle` (Champions / Upsell candidates / At-risk / Churn candidates). Pre-Apr 2026 this was a 3-signal score (revenue + pixel + ad platform); it was replaced because pixel/ad-platform are install-time signals, not usage signals. Health matrix intentionally still uses the looser 30d window — the goal there is to flag *currently* disengaged paying shops, not to filter for post-subscribe value-getting.
+- **Champion** (`lib/data/icp.ts:isChampion`) — installed AND paying AND tenure ≥ 90d AND `revenue90d > 0` AND `isSuperActive(shop)`. The super-active check is what stops a shop that paid once a year ago and never came back from being labelled a champion, and ensures Champions are people actually opening report pages — i.e. getting value.
 - **Plan tier** (`lib/data/health.ts`) — `paid` if `isPaying && plan ∈ {standard, pro, platinum}`, else `free`.
-- **Cohort retention** (`lib/data/cohorts.ts`) — cohort = install month. A shop is "retained in month N" iff it fired ≥1 `$pageview` in the calendar month that is N months after its install month. Crucially this is *not* "still installed" — shops that stay installed but stop using the app drop off the curve. Cohort size still comes from installs, so percentages are comparable across rows.
+- **Cohort retention** (`lib/data/cohorts.ts`) — cohort = install month. The page renders two charts: an "active" chart where a shop is "retained in month N" iff it fired ≥1 `$pageview` in calendar month (install + N), and a "super-active" chart that requires ≥3 report pageviews in that month. Crucially this is *not* "still installed" — shops that stay installed but stop visiting drop off the curve. Cohort size comes from installs, so percentages are comparable across rows.
 
 ### Where to look for what
 
 | Concern | File |
 |---------|------|
-| Active / engagement / pageview signal | `lib/data/activity.ts` |
-| Shop profile + revenue join | `lib/data/insights.ts` |
+| Active / super-active / pageview signal + helpers | `lib/data/activity.ts` |
+| Shop profile + revenue join + `firstPaidAt` | `lib/data/insights.ts` |
 | Champion / ICP scorecard / churn classification | `lib/data/icp.ts` |
 | Health matrix (plan tier × engagement tier) | `lib/data/health.ts` |
-| Cohort retention | `lib/data/cohorts.ts` |
+| Cohort retention (active + super-active variants) | `lib/data/cohorts.ts` |
 | MRR movement | `lib/data/mrr.ts` |
 
 ## Writing code

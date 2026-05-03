@@ -10,6 +10,8 @@ import { getShopProfiles, type ShopProfile } from "./insights";
 const COHORT_MONTHS = 18;
 const RETENTION_HORIZON = 12;
 
+export type CohortMetric = "active" | "super-active";
+
 export type CohortSplit = "none" | "orders-at-install" | "acquisition-source";
 
 export type CohortRetentionPoint = {
@@ -128,12 +130,18 @@ export const computeCohortRetention = (params: {
   shops: Array<ShopProfile>;
   monthlyActivity: Array<ShopMonthlyActivity>;
   split: CohortSplit;
+  metric: CohortMetric;
 }): CohortRetentionResult => {
   const todayKey = monthKey(new Date());
   const earliestCohort = addMonths(todayKey, -(COHORT_MONTHS - 1));
 
   const activeMonthsByShop = new Map(
-    params.monthlyActivity.map((a) => [a.shop, a.activeMonths]),
+    params.monthlyActivity.map((a) => {
+      return [
+        a.shop,
+        params.metric === "super-active" ? a.superActiveMonths : a.activeMonths,
+      ];
+    }),
   );
 
   type Bucket = {
@@ -213,7 +221,10 @@ export const computeCohortRetention = (params: {
 };
 
 export const getCohortRetention = cache(
-  async (params: { split: CohortSplit }): Promise<CohortRetentionResult> => {
+  async (params: {
+    split: CohortSplit;
+    metric: CohortMetric;
+  }): Promise<CohortRetentionResult> => {
     const [shops, monthlyActivity] = await Promise.all([
       getShopProfiles(),
       getShopMonthlyActivity(),
@@ -222,6 +233,7 @@ export const getCohortRetention = cache(
       shops,
       monthlyActivity,
       split: params.split,
+      metric: params.metric,
     });
   },
 );

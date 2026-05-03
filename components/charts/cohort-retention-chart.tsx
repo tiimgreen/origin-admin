@@ -1,17 +1,7 @@
 "use client";
 
-import {
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-
 import { formatPercent } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import type {
   CohortRetentionPoint,
   CohortRetentionSeries,
@@ -22,66 +12,13 @@ type CohortRetentionChartProps = {
   data: Array<CohortRetentionPoint>;
 };
 
-type TooltipPayloadItem = {
-  name: string;
-  value: number | null;
-  color: string;
-  dataKey: string;
-};
+const cellStyle = (value: number) => {
+  const intensity = Math.max(0, Math.min(1, value));
+  const pct = (intensity * 100).toFixed(1);
 
-const SERIES_COLORS = [
-  "var(--color-chart-1)",
-  "var(--color-chart-2)",
-  "var(--color-chart-3)",
-  "var(--color-chart-4)",
-  "var(--color-chart-5)",
-];
-
-const TooltipContent = ({
-  active,
-  payload,
-  label,
-}: {
-  active?: boolean;
-  payload?: Array<TooltipPayloadItem>;
-  label?: number;
-}) => {
-  if (!active || !payload || payload.length === 0 || label === undefined) {
-    return null;
-  }
-
-  const visible = payload.filter((p) => {
-    return p.value !== null && p.value !== undefined;
-  });
-
-  if (visible.length === 0) {
-    return null;
-  }
-
-  return (
-    <div className="rounded-md border bg-card px-3 py-2 text-sm shadow-md">
-      <div className="text-xs font-medium text-muted-foreground">
-        Month {label}
-      </div>
-      {visible.map((item) => {
-        return (
-          <div
-            key={item.dataKey}
-            className="mt-1 flex items-center gap-2 tabular-nums"
-          >
-            <span
-              className="h-2 w-2 rounded-full"
-              style={{ backgroundColor: item.color }}
-            />
-            <span className="text-muted-foreground">{item.name}</span>
-            <span className="ml-auto font-medium">
-              {formatPercent(item.value ?? 0)}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
+  return {
+    backgroundColor: `color-mix(in oklch, var(--color-chart-1) ${pct}%, transparent)`,
+  };
 };
 
 export const CohortRetentionChart = ({
@@ -96,74 +33,66 @@ export const CohortRetentionChart = ({
     );
   }
 
-  return (
-    <ResponsiveContainer width="100%" height={320}>
-      <LineChart
-        data={data}
-        margin={{ top: 12, right: 12, left: 0, bottom: 0 }}
-      >
-        <CartesianGrid
-          strokeDasharray="3 3"
-          stroke="var(--color-border)"
-          vertical={false}
-        />
-        <XAxis
-          dataKey="monthsSinceInstall"
-          tickLine={false}
-          axisLine={false}
-          stroke="var(--color-muted-foreground)"
-          tick={{ fontSize: 12 }}
-          tickFormatter={(v: number) => {
-            return `M${v}`;
-          }}
-        />
-        <YAxis
-          tickFormatter={(v: number) => {
-            return formatPercent(v, 0);
-          }}
-          tickLine={false}
-          axisLine={false}
-          stroke="var(--color-muted-foreground)"
-          tick={{ fontSize: 12 }}
-          width={48}
-          domain={[0, "auto"]}
-        />
-        <Tooltip
-          content={(props) => {
-            const payload = props.payload as
-              | ReadonlyArray<TooltipPayloadItem>
-              | undefined;
+  const horizonMonths = data.map((d) => {
+    return d.monthsSinceInstall;
+  });
 
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full border-separate border-spacing-0 text-xs tabular-nums">
+        <thead>
+          <tr className="text-muted-foreground">
+            <th className="sticky left-0 z-10 bg-card px-3 py-2 text-left font-medium">
+              Cohort
+            </th>
+            <th className="px-2 py-2 text-right font-medium">Size</th>
+            {horizonMonths.map((m) => {
+              return (
+                <th
+                  key={m}
+                  className="px-2 py-2 text-center font-medium"
+                >
+                  M{m}
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {series.map((s) => {
             return (
-              <TooltipContent
-                active={props.active}
-                payload={payload ? Array.from(payload) : undefined}
-                label={props.label as number | undefined}
-              />
+              <tr key={s.key} className="group">
+                <td className="sticky left-0 z-10 whitespace-nowrap bg-card px-3 py-1.5 text-left font-medium text-foreground group-hover:bg-muted/40">
+                  {s.label}
+                </td>
+                <td className="px-2 py-1.5 text-right text-muted-foreground">
+                  {s.cohortSize.toLocaleString()}
+                </td>
+                {horizonMonths.map((m, i) => {
+                  const point = data[i];
+                  const value = point[s.key];
+                  const hasValue = typeof value === "number";
+
+                  return (
+                    <td
+                      key={m}
+                      className={cn(
+                        "px-2 py-1.5 text-center",
+                        hasValue
+                          ? "text-foreground"
+                          : "text-muted-foreground/40",
+                      )}
+                      style={hasValue ? cellStyle(value) : undefined}
+                    >
+                      {hasValue ? formatPercent(value, 0) : "–"}
+                    </td>
+                  );
+                })}
+              </tr>
             );
-          }}
-        />
-        <Legend
-          wrapperStyle={{ fontSize: 12 }}
-          iconType="line"
-          iconSize={12}
-        />
-        {series.map((s, i) => {
-          return (
-            <Line
-              key={s.key}
-              type="monotone"
-              dataKey={s.key}
-              name={`${s.label} (${s.cohortSize})`}
-              stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
-              strokeWidth={2}
-              dot={false}
-              connectNulls={false}
-              isAnimationActive={false}
-            />
-          );
-        })}
-      </LineChart>
-    </ResponsiveContainer>
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 };

@@ -71,6 +71,7 @@ export type ShopProfile = {
   initialInstalledAt: string | null;
   lastInstalledAt: string | null;
   uninstalledAt: string | null;
+  firstPaidAt: string | null;
   originPixelAddedAt: string | null;
   orderCountAtInstall: number | null;
   shopifyPlanName: string | null;
@@ -139,10 +140,12 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       .from("subscriptions")
       .select(`
         id,
+        shop,
         plan_key,
         price,
         status,
-        has_completed_setup
+        has_completed_setup,
+        activated_at
       `)
       .limit(20000),
   ]);
@@ -182,6 +185,7 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       has_completed_setup: boolean;
     }
   >();
+  const firstPaidByShop = new Map<string, string>();
   for (const sub of subscriptionsResult.data ?? []) {
     subscriptionsById.set(sub.id, {
       plan_key: sub.plan_key,
@@ -189,6 +193,13 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       status: sub.status,
       has_completed_setup: sub.has_completed_setup,
     });
+
+    if (sub.activated_at && (sub.price ?? 0) > 0) {
+      const existing = firstPaidByShop.get(sub.shop);
+      if (!existing || sub.activated_at < existing) {
+        firstPaidByShop.set(sub.shop, sub.activated_at);
+      }
+    }
   }
 
   return shops.map((shop) => {
@@ -209,6 +220,7 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       initialInstalledAt: shop.initialInstalledAt,
       lastInstalledAt: shop.lastInstalledAt,
       uninstalledAt: shop.uninstalled_at,
+      firstPaidAt: firstPaidByShop.get(shop.shop) ?? null,
       originPixelAddedAt: shop.origin_pixel_added,
       orderCountAtInstall: shop.order_count_at_install,
       shopifyPlanName:
@@ -260,6 +272,8 @@ export type RevenueHistogramPoint = {
 export type ShopWithRevenue = ShopProfile & {
   monthlyAvgRevenue: number;
   revenue90d: number;
+  pageviews14d: number;
+  reportPageviews14d: number;
   pageviews30d: number;
   lastSeenAt: string | null;
 };
@@ -281,6 +295,8 @@ export const joinShopsWithRevenue = (
         ...shop,
         monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
         revenue90d: r?.revenue90d ?? 0,
+        pageviews14d: a?.pageviews14d ?? 0,
+        reportPageviews14d: a?.reportPageviews14d ?? 0,
         pageviews30d: a?.pageviews30d ?? 0,
         lastSeenAt: a?.lastSeenAt ?? null,
       };
@@ -302,6 +318,8 @@ export const joinAllShopsWithRevenue = (
       ...shop,
       monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
       revenue90d: r?.revenue90d ?? 0,
+      pageviews14d: a?.pageviews14d ?? 0,
+      reportPageviews14d: a?.reportPageviews14d ?? 0,
       pageviews30d: a?.pageviews30d ?? 0,
       lastSeenAt: a?.lastSeenAt ?? null,
     };

@@ -1,3 +1,4 @@
+import { isSuperActive } from "./activity";
 import type { ShopProfile, ShopWithRevenue } from "./insights";
 
 export type Segment = {
@@ -40,7 +41,7 @@ export const isChampion = (shop: ShopWithRevenue) => {
   if (shop.revenue90d <= 0) {
     return false;
   }
-  if (shop.pageviews30d <= 0) {
+  if (!isSuperActive(shop)) {
     return false;
   }
   return true;

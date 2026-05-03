@@ -45,3 +45,37 @@ export const posthogHogQLQuery = async <R extends Array<unknown>>({
 
   return response.data;
 };
+
+type PaginatedHogQLParams = {
+  query: string;
+  pageSize?: number;
+  maxPages?: number;
+};
+
+// Auto-paginates a HogQL query using LIMIT/OFFSET. The query MUST include a
+// stable ORDER BY so rows do not shift between pages. PostHog's default page
+// cap is 10,000, so pageSize defaults to that.
+export const posthogHogQLQueryAll = async <Row>({
+  query,
+  pageSize = 10_000,
+  maxPages = 100,
+}: PaginatedHogQLParams): Promise<Array<Row>> => {
+  const all: Array<Row> = [];
+  let offset = 0;
+
+  for (let page = 0; page < maxPages; page++) {
+    const paged = `${query.trimEnd()}\nLIMIT ${pageSize} OFFSET ${offset}`;
+    const response = await posthogHogQLQuery<Array<Row>>({ query: paged });
+    all.push(...response.results);
+
+    if (!response.hasMore || response.results.length < pageSize) {
+      return all;
+    }
+    offset += pageSize;
+  }
+
+  console.warn(
+    `[posthogHogQLQueryAll] hit maxPages=${maxPages} (pageSize=${pageSize}); results may be truncated`,
+  );
+  return all;
+};

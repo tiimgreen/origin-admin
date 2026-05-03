@@ -7,7 +7,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/layout/page-header";
 import { CohortRetentionChart } from "@/components/charts/cohort-retention-chart";
-import { getCohortRetention, type CohortSplit } from "@/lib/data/cohorts";
+import {
+  getCohortRetention,
+  type CohortMetric,
+  type CohortSplit,
+} from "@/lib/data/cohorts";
+import { SUPER_ACTIVE_PAGEVIEW_THRESHOLD } from "@/lib/data/activity";
 import { cn } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -64,27 +69,31 @@ const SplitToggle = ({ current }: SplitToggleProps) => {
   );
 };
 
-type CohortBoardProps = {
+type CohortChartProps = {
+  metric: CohortMetric;
   split: CohortSplit;
+  splitHint: string;
 };
 
-const CohortBoard = async ({ split }: CohortBoardProps) => {
-  const result = await getCohortRetention({ split });
+const CohortChart = async ({ metric, split, splitHint }: CohortChartProps) => {
+  const result = await getCohortRetention({ split, metric });
 
-  const activeOption = SPLIT_OPTIONS.find((o) => {
-    return o.key === split;
-  });
+  const title =
+    metric === "super-active" ? "Super-active retention" : "Active retention";
+  const description =
+    metric === "super-active"
+      ? `% of cohort with ≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report-page pageviews in their N-th month since install`
+      : "% of cohort with ≥1 app pageview in their N-th month since install";
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between space-y-0">
         <div>
           <CardTitle className="text-base font-semibold text-foreground">
-            Retention by cohort
+            {title}
           </CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            % of each cohort with ≥1 app pageview in their N-th month since install · last 18 months ·{" "}
-            {activeOption?.hint ?? ""}
+            {description} · last 18 months · {splitHint}
           </p>
         </div>
         <Badge variant="outline" className="font-mono text-[10px]">
@@ -98,7 +107,7 @@ const CohortBoard = async ({ split }: CohortBoardProps) => {
   );
 };
 
-const CohortBoardSkeleton = () => {
+const CohortChartSkeleton = () => {
   return (
     <Card>
       <CardHeader className="space-y-2">
@@ -119,6 +128,8 @@ type CohortsPageProps = {
 export default async function CohortsPage({ searchParams }: CohortsPageProps) {
   const params = await searchParams;
   const split: CohortSplit = isCohortSplit(params.split) ? params.split : "none";
+  const splitHint =
+    SPLIT_OPTIONS.find((o) => o.key === split)?.hint ?? "";
 
   return (
     <div className="space-y-6">
@@ -128,16 +139,22 @@ export default async function CohortsPage({ searchParams }: CohortsPageProps) {
         actions={<SplitToggle current={split} />}
       />
 
-      <Suspense key={split} fallback={<CohortBoardSkeleton />}>
-        <CohortBoard split={split} />
+      <Suspense key={`active-${split}`} fallback={<CohortChartSkeleton />}>
+        <CohortChart metric="active" split={split} splitHint={splitHint} />
+      </Suspense>
+
+      <Suspense key={`super-${split}`} fallback={<CohortChartSkeleton />}>
+        <CohortChart metric="super-active" split={split} splitHint={splitHint} />
       </Suspense>
 
       <Separator />
       <p className="text-xs text-muted-foreground">
         Cohort = shops grouped by their <code className="text-[10px]">initialInstalledAt</code> month.
-        &ldquo;Retained in month N&rdquo; means the shop fired at least one PostHog{" "}
+        &ldquo;Active in month N&rdquo; means ≥1 PostHog{" "}
         <code className="text-[10px]">$pageview</code> in the calendar month that is N months after
-        their install month. Shops that stay installed but stop visiting the app drop off the curve.
+        install. &ldquo;Super-active&rdquo; tightens this to ≥{SUPER_ACTIVE_PAGEVIEW_THRESHOLD} pageviews
+        on report pages (excluding <code className="text-[10px]">/settings</code> and{" "}
+        <code className="text-[10px]">/utm-notepad</code>) — a proxy for shops actually getting value.
       </p>
     </div>
   );

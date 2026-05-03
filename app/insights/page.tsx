@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 import Link from "next/link";
-import { Compass, Globe, Layers, PiggyBank, Target, Users } from "lucide-react";
+import { Compass, Globe, Layers, PiggyBank, Target, Users, Zap } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -36,7 +36,10 @@ import {
 } from "@/lib/data/insights";
 import {
   ACTIVE_PAGEVIEW_WINDOW_DAYS,
+  SUPER_ACTIVE_PAGEVIEW_THRESHOLD,
   getShopActivity,
+  isActive,
+  isSuperActive,
 } from "@/lib/data/activity";
 import {
   computeAcquisitionBreakdown,
@@ -50,7 +53,7 @@ import { FX_AS_OF } from "@/lib/data/currencies";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
-const CHAMPION_DEFINITION = "tenure ≥ 90d, paying, revenue in last 90d, active in app last 30d";
+const CHAMPION_DEFINITION = `tenure ≥ 90d, paying, revenue in last 90d, super-active (≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report pageviews in last ${ACTIVE_PAGEVIEW_WINDOW_DAYS}d, post-subscribe)`;
 const CHURNER_DEFINITION = "uninstalled within 30d of install";
 
 const CHURN_SPLIT_OPTIONS: Array<{ key: ChurnSplitBy; label: string }> = [
@@ -93,7 +96,9 @@ const InsightsBoard = async ({ churnSplit }: InsightsBoardProps) => {
   const churnTypes = computeChurnTypeBreakdown(allWithRevenue);
   const acquisition = computeAcquisitionBreakdown(allWithRevenue, allWithRevenue);
 
-  const totalActiveShops = joined.filter((s) => s.pageviews30d > 0).length;
+  const totalActiveShops = joined.filter(isActive).length;
+  const totalSuperActiveShops = joined.filter(isSuperActive).length;
+  const subscribedShops = joined.filter((s) => s.firstPaidAt !== null).length;
   const totalRevenue90d = joined.reduce((sum, s) => sum + s.revenue90d, 0);
   const medianRevenue = (() => {
     const active = joined
@@ -112,16 +117,26 @@ const InsightsBoard = async ({ churnSplit }: InsightsBoardProps) => {
 
   return (
     <>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
         <KpiCard
           label={`Active shops (${ACTIVE_PAGEVIEW_WINDOW_DAYS}d)`}
           value={formatNumber({ value: totalActiveShops })}
           hint={
-            joined.length > 0
-              ? `${formatPercent(totalActiveShops / joined.length)} of installed · visited app`
+            subscribedShops > 0
+              ? `${formatPercent(totalActiveShops / subscribedShops)} of subscribed · ≥1 PV post-subscribe`
               : undefined
           }
           icon={Users}
+        />
+        <KpiCard
+          label={`Super-active (${ACTIVE_PAGEVIEW_WINDOW_DAYS}d)`}
+          value={formatNumber({ value: totalSuperActiveShops })}
+          hint={
+            subscribedShops > 0
+              ? `${formatPercent(totalSuperActiveShops / subscribedShops)} of subscribed · ≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report PVs`
+              : undefined
+          }
+          icon={Zap}
         />
         <KpiCard
           label="Revenue tracked (90d)"
@@ -132,7 +147,7 @@ const InsightsBoard = async ({ churnSplit }: InsightsBoardProps) => {
         <KpiCard
           label="Median monthly GMV"
           value={formatCurrency({ amount: medianRevenue, compact: true })}
-          hint="among active shops"
+          hint="among shops with revenue"
           icon={Target}
         />
         <KpiCard
