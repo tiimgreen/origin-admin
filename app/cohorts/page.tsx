@@ -12,7 +12,7 @@ import {
   type CohortMetric,
   type CohortSplit,
 } from "@/lib/data/cohorts";
-import { SUPER_ACTIVE_PAGEVIEW_THRESHOLD } from "@/lib/data/activity";
+import { SUPER_ACTIVE_SESSION_THRESHOLD } from "@/lib/data/activity";
 import { cn } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -82,8 +82,8 @@ const CohortChart = async ({ metric, split, splitHint }: CohortChartProps) => {
     metric === "super-active" ? "Super-active retention" : "Active retention";
   const description =
     metric === "super-active"
-      ? `% of cohort with ≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report-page pageviews in their N-th month since install`
-      : "% of cohort with ≥1 app pageview in their N-th month since install";
+      ? `% of cohort with ≥${SUPER_ACTIVE_SESSION_THRESHOLD} sessions in their N-th month since install`
+      : "% of cohort with ≥1 app session in their N-th month since install";
 
   return (
     <Card>
@@ -150,11 +150,10 @@ export default async function CohortsPage({ searchParams }: CohortsPageProps) {
       <Separator />
       <p className="text-xs text-muted-foreground">
         Cohort = shops grouped by their <code className="text-[10px]">initialInstalledAt</code> month.
-        &ldquo;Active in month N&rdquo; means ≥1 PostHog{" "}
-        <code className="text-[10px]">$pageview</code> in the calendar month that is N months after
-        install. &ldquo;Super-active&rdquo; tightens this to ≥{SUPER_ACTIVE_PAGEVIEW_THRESHOLD} pageviews
-        on report pages (excluding <code className="text-[10px]">/settings</code> and{" "}
-        <code className="text-[10px]">/utm-notepad</code>) — a proxy for shops actually getting value.
+        &ldquo;Active in month N&rdquo; means ≥1 app session (from{" "}
+        <code className="text-[10px]">shop_user_sessions</code>) in the calendar month that is N months
+        after install. &ldquo;Super-active&rdquo; tightens this to ≥{SUPER_ACTIVE_SESSION_THRESHOLD} sessions
+        in that month — a proxy for shops actually getting value.
       </p>
     </div>
   );

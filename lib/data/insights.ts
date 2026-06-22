@@ -79,6 +79,9 @@ export type ShopProfile = {
   isPartnerDev: boolean;
   installFbclid: string | null;
   installGclid: string | null;
+  installUtmSource: string | null;
+  installSurfaceType: string | null;
+  vertical: string | null;
   connectedPlatformKeys: Array<string>;
 };
 
@@ -112,6 +115,9 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
       order_count_at_install,
       app_install_fbclid,
       app_install_gclid,
+      app_install_utm_source,
+      app_install_surface_type,
+      vertical,
       plan_public_display_name,
       shopify_plus,
       is_partner_development_plan,
@@ -232,6 +238,9 @@ export const getShopProfiles = cache(async (): Promise<Array<ShopProfile>> => {
         shopData?.plan?.partnerDevelopment === true,
       installFbclid: shop.app_install_fbclid,
       installGclid: shop.app_install_gclid,
+      installUtmSource: shop.app_install_utm_source,
+      installSurfaceType: shop.app_install_surface_type,
+      vertical: shop.vertical,
       connectedPlatformKeys: platformsByShop.get(shop.shop) ?? [],
     };
   });
@@ -272,9 +281,8 @@ export type RevenueHistogramPoint = {
 export type ShopWithRevenue = ShopProfile & {
   monthlyAvgRevenue: number;
   revenue90d: number;
-  pageviews14d: number;
-  reportPageviews14d: number;
-  pageviews30d: number;
+  sessions14d: number;
+  sessions30d: number;
   lastSeenAt: string | null;
 };
 
@@ -295,9 +303,8 @@ export const joinShopsWithRevenue = (
         ...shop,
         monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
         revenue90d: r?.revenue90d ?? 0,
-        pageviews14d: a?.pageviews14d ?? 0,
-        reportPageviews14d: a?.reportPageviews14d ?? 0,
-        pageviews30d: a?.pageviews30d ?? 0,
+        sessions14d: a?.sessions14d ?? 0,
+        sessions30d: a?.sessions30d ?? 0,
         lastSeenAt: a?.lastSeenAt ?? null,
       };
     });
@@ -318,9 +325,8 @@ export const joinAllShopsWithRevenue = (
       ...shop,
       monthlyAvgRevenue: r?.monthlyAvgRevenue ?? 0,
       revenue90d: r?.revenue90d ?? 0,
-      pageviews14d: a?.pageviews14d ?? 0,
-      reportPageviews14d: a?.reportPageviews14d ?? 0,
-      pageviews30d: a?.pageviews30d ?? 0,
+      sessions14d: a?.sessions14d ?? 0,
+      sessions30d: a?.sessions30d ?? 0,
       lastSeenAt: a?.lastSeenAt ?? null,
     };
   });

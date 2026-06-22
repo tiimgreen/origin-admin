@@ -3,6 +3,9 @@
     "deny": [
       "Read(**/.env*)",
       "Bash(rm -rf *)"
+    ],
+    "additionalDirectories": [
+      "/Users/tim/code/origin-tinybird"
     ]
   }
 }

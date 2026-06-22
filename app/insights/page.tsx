@@ -35,8 +35,8 @@ import {
   joinShopsWithRevenue,
 } from "@/lib/data/insights";
 import {
-  ACTIVE_PAGEVIEW_WINDOW_DAYS,
-  SUPER_ACTIVE_PAGEVIEW_THRESHOLD,
+  ACTIVE_SESSION_WINDOW_DAYS,
+  SUPER_ACTIVE_SESSION_THRESHOLD,
   getShopActivity,
   isActive,
   isSuperActive,
@@ -53,7 +53,7 @@ import { FX_AS_OF } from "@/lib/data/currencies";
 import { cn } from "@/lib/utils";
 import { formatCurrency, formatNumber, formatPercent } from "@/lib/format";
 
-const CHAMPION_DEFINITION = `tenure ≥ 90d, paying, revenue in last 90d, super-active (≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report pageviews in last ${ACTIVE_PAGEVIEW_WINDOW_DAYS}d, post-subscribe)`;
+const CHAMPION_DEFINITION = `tenure ≥ 90d, paying, revenue in last 90d, super-active (≥${SUPER_ACTIVE_SESSION_THRESHOLD} sessions in last ${ACTIVE_SESSION_WINDOW_DAYS}d, post-subscribe)`;
 const CHURNER_DEFINITION = "uninstalled within 30d of install";
 
 const CHURN_SPLIT_OPTIONS: Array<{ key: ChurnSplitBy; label: string }> = [
@@ -119,21 +119,21 @@ const InsightsBoard = async ({ churnSplit }: InsightsBoardProps) => {
     <>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
         <KpiCard
-          label={`Active shops (${ACTIVE_PAGEVIEW_WINDOW_DAYS}d)`}
+          label={`Active shops (${ACTIVE_SESSION_WINDOW_DAYS}d)`}
           value={formatNumber({ value: totalActiveShops })}
           hint={
             subscribedShops > 0
-              ? `${formatPercent(totalActiveShops / subscribedShops)} of subscribed · ≥1 PV post-subscribe`
+              ? `${formatPercent(totalActiveShops / subscribedShops)} of subscribed · ≥1 session post-subscribe`
               : undefined
           }
           icon={Users}
         />
         <KpiCard
-          label={`Super-active (${ACTIVE_PAGEVIEW_WINDOW_DAYS}d)`}
+          label={`Super-active (${ACTIVE_SESSION_WINDOW_DAYS}d)`}
           value={formatNumber({ value: totalSuperActiveShops })}
           hint={
             subscribedShops > 0
-              ? `${formatPercent(totalSuperActiveShops / subscribedShops)} of subscribed · ≥${SUPER_ACTIVE_PAGEVIEW_THRESHOLD} report PVs`
+              ? `${formatPercent(totalSuperActiveShops / subscribedShops)} of subscribed · ≥${SUPER_ACTIVE_SESSION_THRESHOLD} sessions`
               : undefined
           }
           icon={Zap}

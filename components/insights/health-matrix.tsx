@@ -46,7 +46,7 @@ export const HealthMatrixCard = ({ matrix }: HealthMatrixCardProps) => {
           Customer health matrix
         </CardTitle>
         <p className="mt-1 text-xs text-muted-foreground">
-          Plan tier × engagement · &ldquo;high&rdquo; engagement = ≥1 app pageview in last 30d (PostHog) · {formatNumber({ value: matrix.totalShops })} installed shops · click a section to see shops
+          Plan tier × engagement · &ldquo;high&rdquo; engagement = ≥1 app session in last 30d · {formatNumber({ value: matrix.totalShops })} installed shops · click a section to see shops
         </p>
       </CardHeader>
       <CardContent>
@@ -183,7 +183,7 @@ const QuadrantShopList = ({ quadrant }: QuadrantShopListProps) => {
               <TableHead>Installed</TableHead>
               <TableHead>Plan</TableHead>
               <TableHead className="text-right">Price</TableHead>
-              <TableHead className="text-right">Pageviews (30d)</TableHead>
+              <TableHead className="text-right">Sessions (30d)</TableHead>
               <TableHead className="text-right">30d GMV</TableHead>
               <TableHead className="text-right">30d Orders</TableHead>
             </TableRow>
@@ -229,7 +229,7 @@ const QuadrantShopList = ({ quadrant }: QuadrantShopListProps) => {
                       : "—"}
                   </TableCell>
                   <TableCell className="text-right tabular-nums">
-                    {formatNumber({ value: shop.pageviews30d })}
+                    {formatNumber({ value: shop.sessions30d })}
                   </TableCell>
                   <TableCell className="text-right tabular-nums">
                     {formatCurrency({ amount: shop.revenue30d, compact: true })}

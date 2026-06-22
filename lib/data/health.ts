@@ -73,7 +73,7 @@ export type HealthQuadrantShop = {
   plan: string | null;
   subscriptionPrice: number | null;
   installedAt: string | null;
-  pageviews30d: number;
+  sessions30d: number;
   revenue30d: number;
   orders30d: number;
 };
@@ -103,7 +103,7 @@ const planTierFor = (shop: ShopWithRevenue): PlanTier => {
 };
 
 const engagementTierFor = (shop: ShopWithRevenue): EngagementTier => {
-  return shop.pageviews30d > 0 ? "high" : "low";
+  return shop.sessions30d > 0 ? "high" : "low";
 };
 
 const QUADRANT_DEFINITIONS: Array<{
@@ -217,7 +217,7 @@ export const computeHealthMatrix = (params: {
           plan: s.plan,
           subscriptionPrice: s.subscriptionPrice,
           installedAt: s.initialInstalledAt ?? s.lastInstalledAt,
-          pageviews30d: s.pageviews30d,
+          sessions30d: s.sessions30d,
           revenue30d: t?.last30Revenue ?? 0,
           orders30d: t?.last30Orders ?? 0,
         };
@@ -226,7 +226,7 @@ export const computeHealthMatrix = (params: {
         if (b.revenue30d !== a.revenue30d) {
           return b.revenue30d - a.revenue30d;
         }
-        return b.pageviews30d - a.pageviews30d;
+        return b.sessions30d - a.sessions30d;
       })
       .slice(0, SHOP_LIST_LIMIT);
 
