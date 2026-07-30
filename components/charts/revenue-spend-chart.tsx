@@ -12,13 +12,10 @@ import {
 
 import { formatCurrency } from "@/lib/format";
 import { formatMonthLabel } from "@/lib/data/dates";
+import type { MonthlyFinancialsPoint } from "@/lib/data/shop-profile";
 
-type RevenueAreaChartProps = {
-  data: Array<{
-    monthKey: string;
-    revenue: number;
-    originRevenue: number;
-  }>;
+type RevenueSpendChartProps = {
+  data: Array<MonthlyFinancialsPoint>;
 };
 
 type TooltipPayloadItem = {
@@ -66,7 +63,7 @@ const TooltipContent = ({
   );
 };
 
-export const RevenueAreaChart = ({ data }: RevenueAreaChartProps) => {
+export const RevenueSpendChart = ({ data }: RevenueSpendChartProps) => {
   return (
     <ResponsiveContainer width="100%" height={300}>
       <AreaChart
@@ -86,7 +83,7 @@ export const RevenueAreaChart = ({ data }: RevenueAreaChartProps) => {
               stopOpacity={0.02}
             />
           </linearGradient>
-          <linearGradient id="originRevenue" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id="adSpend" x1="0" y1="0" x2="0" y2="1">
             <stop
               offset="0%"
               stopColor="var(--color-chart-2)"
@@ -142,18 +139,18 @@ export const RevenueAreaChart = ({ data }: RevenueAreaChartProps) => {
         <Area
           type="monotone"
           dataKey="revenue"
-          name="GMV"
+          name="Revenue"
           stroke="var(--color-chart-1)"
           strokeWidth={2}
           fill="url(#revenue)"
         />
         <Area
           type="monotone"
-          dataKey="originRevenue"
-          name="Origin-tracked GMV"
+          dataKey="adSpend"
+          name="Ad spend"
           stroke="var(--color-chart-2)"
           strokeWidth={2}
-          fill="url(#originRevenue)"
+          fill="url(#adSpend)"
         />
       </AreaChart>
     </ResponsiveContainer>

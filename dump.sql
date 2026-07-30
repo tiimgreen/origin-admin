@@ -86,6 +86,42 @@ CREATE TYPE "public"."CONNECTED_ACCOUNT_STATUS" AS ENUM (
 ALTER TYPE "public"."CONNECTED_ACCOUNT_STATUS" OWNER TO "postgres";
 
 
+CREATE TYPE "public"."COST_CATEGORY" AS ENUM (
+    'COGS',
+    'SHIPPING',
+    'TAX',
+    'REFUNDS',
+    'MARKETING',
+    'OPERATIONS',
+    'OTHER',
+    'TRANSACTION'
+);
+
+
+ALTER TYPE "public"."COST_CATEGORY" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."COST_RECURRING_INTERVAL" AS ENUM (
+    'DAILY',
+    'WEEKLY',
+    'MONTHLY',
+    'YEARLY'
+);
+
+
+ALTER TYPE "public"."COST_RECURRING_INTERVAL" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."COST_SOURCE" AS ENUM (
+    'MANUAL',
+    'SHOPIFY',
+    'EXTERNAL_APP'
+);
+
+
+ALTER TYPE "public"."COST_SOURCE" OWNER TO "postgres";
+
+
 CREATE TYPE "public"."DELAYED_EVENT_STATUS" AS ENUM (
     'PENDING',
     'PROCESSING',
@@ -158,6 +194,29 @@ CREATE TYPE "public"."SHOP_CLIENT_SOURCE" AS ENUM (
 
 
 ALTER TYPE "public"."SHOP_CLIENT_SOURCE" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."SHOP_COST_SCOPE" AS ENUM (
+    'STORE',
+    'UTM',
+    'AD_CAMPAIGN',
+    'AD_SET',
+    'AD'
+);
+
+
+ALTER TYPE "public"."SHOP_COST_SCOPE" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."SHOP_COST_TYPE" AS ENUM (
+    'FIXED',
+    'RECURRING',
+    'PERCENT_AD_SPEND',
+    'PER_CLICK'
+);
+
+
+ALTER TYPE "public"."SHOP_COST_TYPE" OWNER TO "postgres";
 
 
 CREATE TYPE "public"."SHOP_EVENT_SOURCE" AS ENUM (
@@ -283,6 +342,39 @@ $$;
 
 
 ALTER FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "p_min_age" interval, "p_limit" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer DEFAULT 1000) RETURNS integer
+    LANGUAGE "plpgsql"
+    SET "statement_timeout" TO '30min'
+    AS $$
+DECLARE
+    v_updated_count integer;
+BEGIN
+    -- Flip up to p_batch_size orders to their snapshot target. Idempotent: rows
+    -- already at their target are excluded by IS DISTINCT FROM, so repeated calls
+    -- (and retries) simply drain the remaining work. Returns the number flipped;
+    -- the caller loops until this returns 0.
+    WITH target AS (
+        SELECT pvco.order_id, pvco.new_is_visible
+        FROM public.plan_visibility_change_job_orders pvco
+        JOIN public.orders o ON o.id = pvco.order_id
+        WHERE pvco.job_id = p_job_id
+        AND o.is_visible IS DISTINCT FROM pvco.new_is_visible
+        LIMIT p_batch_size
+    )
+    UPDATE public.orders o
+    SET is_visible = target.new_is_visible
+    FROM target
+    WHERE o.id = target.order_id;
+
+    GET DIAGNOSTICS v_updated_count = ROW_COUNT;
+    RETURN v_updated_count;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."backfill_ads_summary_spend_shop_currency_for_shops"() RETURNS "void"
@@ -2022,6 +2114,7 @@ CREATE OR REPLACE FUNCTION "public"."export_traffic_sources"("p_shop" "text") RE
       t.shop,
       t.platform_key,
       t.platform_ad_id,
+      t.platform_campaign_id,
       t.utm_source,
       t.utm_medium,
       t.utm_campaign,
@@ -2031,8 +2124,11 @@ CREATE OR REPLACE FUNCTION "public"."export_traffic_sources"("p_shop" "text") RE
     from public.traffic_sources t
     where t.shop = p_shop
   ),
+  -- ad path: full ad -> ad_set -> ad_campaign hierarchy, scoped to the shop and
+  -- matched on (platform, external_id) so ids can't collide across platforms/shops.
   ad_lookup as (
     select
+      a.platform    as platform,
       a.external_id as external_id,
       a.id          as ad_id,
       aset.id       as ad_set_id,
@@ -2042,6 +2138,24 @@ CREATE OR REPLACE FUNCTION "public"."export_traffic_sources"("p_shop" "text") RE
       on aset.id = a.ad_set_id
     join public.ad_campaigns camp
       on camp.id = aset.ad_campaign_id
+    join public.platform_accounts pa
+      on pa.id = camp.platform_account_id
+    join public.connected_platforms cp
+      on cp.id = pa.platform_id
+    where cp.shop = p_shop
+  ),
+  -- PMAX path: campaigns with no ads/ad_sets, linked directly by platform_campaign_id.
+  campaign_lookup as (
+    select
+      camp.platform    as platform,
+      camp.external_id as external_id,
+      camp.id          as ad_campaign_id
+    from public.ad_campaigns camp
+    join public.platform_accounts pa
+      on pa.id = camp.platform_account_id
+    join public.connected_platforms cp
+      on cp.id = pa.platform_id
+    where cp.shop = p_shop
   )
   select
     ts.id,
@@ -2052,17 +2166,26 @@ CREATE OR REPLACE FUNCTION "public"."export_traffic_sources"("p_shop" "text") RE
     ts.utm_campaign,
     ts.utm_term,
     ts.utm_content,
-    ts.platform_key as ad_platform_key,
+    ts.platform_key   as ad_platform_key,
     ts.platform_ad_id as ad_external_id,
     al.ad_id,
     al.ad_set_id,
-    al.ad_campaign_id,
+    coalesce(al.ad_campaign_id, cl.ad_campaign_id) as ad_campaign_id,
     ts.named_source_id,
-    ns.name as named_source_name,
+    ns.name        as named_source_name,
     ns.favicon_url as named_source_favicon
   from ts
+  -- ad path only fires for rows that carry an ad external id
   left join ad_lookup al
-    on al.external_id = ts.platform_ad_id::text
+    on al.platform = ts.platform_key
+   and al.external_id = ts.platform_ad_id
+   and ts.platform_ad_id <> ''
+  -- campaign path only fires for PMAX rows (no ad external id, campaign id present)
+  left join campaign_lookup cl
+    on cl.platform = ts.platform_key
+   and cl.external_id = ts.platform_campaign_id
+   and ts.platform_ad_id = ''
+   and ts.platform_campaign_id <> ''
   left join public.named_sources ns
     on ns.id = ts.named_source_id
   order by ts.id;
@@ -2396,7 +2519,7 @@ $$;
 ALTER FUNCTION "public"."find_or_create_session_locked"("p_lock_key" "text", "p_shop" "text", "p_unique_hash" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text" DEFAULT NULL::"text", "p_client_id" "uuid" DEFAULT NULL::"uuid", "p_user_agent" "text" DEFAULT NULL::"text", "p_ip_address" "text" DEFAULT NULL::"text", "p_referer" "text" DEFAULT NULL::"text") RETURNS TABLE("out_session_id" "uuid", "out_client_id" "uuid", "out_traffic_source_id" "uuid", "out_created_at" timestamp with time zone, "out_started_at" timestamp with time zone, "out_last_touch" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text" DEFAULT NULL::"text", "p_client_id" "uuid" DEFAULT NULL::"uuid", "p_user_agent" "text" DEFAULT NULL::"text", "p_ip_address" "text" DEFAULT NULL::"text", "p_referer" "text" DEFAULT NULL::"text", "p_channel" "text" DEFAULT NULL::"text") RETURNS TABLE("out_session_id" "uuid", "out_client_id" "uuid", "out_traffic_source_id" "uuid", "out_created_at" timestamp with time zone, "out_started_at" timestamp with time zone, "out_last_touch" timestamp with time zone)
     LANGUAGE "plpgsql"
     AS $$
 DECLARE
@@ -2526,11 +2649,11 @@ BEGIN
     INSERT INTO shop_sessions (
       client_id, shop, started_at, last_touch,
       traffic_source_id, landing_page, landing_page_id,
-      user_agent, ip_address, referer
+      user_agent, ip_address, referer, channel
     ) VALUES (
       v_client_id, p_shop, p_event_timestamp, p_event_timestamp,
       p_traffic_source_id, p_landing_page, p_landing_page_id,
-      p_user_agent, p_ip_address, p_referer
+      p_user_agent, p_ip_address, p_referer, COALESCE(p_channel, '')
     )
     RETURNING shop_sessions.id, shop_sessions.client_id, shop_sessions.traffic_source_id,
               shop_sessions.created_at, shop_sessions.started_at, shop_sessions.last_touch
@@ -2564,7 +2687,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text", "p_channel" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."find_or_create_shop_user_session"("p_shop_user_id" bigint, "p_inactivity_threshold_seconds" integer DEFAULT 1800) RETURNS TABLE("session_id" "uuid", "created" boolean)
@@ -3008,6 +3131,19 @@ $$;
 ALTER FUNCTION "public"."get_touches_summary_for_shop"("p_shop" "text", "p_date_from" "date", "p_date_to" "date") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) RETURNS "void"
+    LANGUAGE "sql"
+    AS $$
+  UPDATE shop_sessions
+      SET number_of_add_to_carts   = number_of_add_to_carts   + p_add_to_carts,
+          number_of_checkout_starts = number_of_checkout_starts + p_checkout_starts
+    WHERE id = p_session_id;
+$$;
+
+
+ALTER FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."make_shop_orders_visible_batch"("p_shop" "text", "p_batch_size" integer) RETURNS integer
     LANGUAGE "plpgsql"
     SET "statement_timeout" TO '30min'
@@ -3117,18 +3253,17 @@ ALTER FUNCTION "public"."mark_first_orders_visible_date_range"("p_shop" "text", 
 
 CREATE OR REPLACE FUNCTION "public"."prepare_plan_visibility_change_job"("p_shop" "text", "p_job_id" "uuid", "p_batch_size" integer DEFAULT 5000) RETURNS TABLE("total_orders" integer, "total_batches" integer)
     LANGUAGE "plpgsql"
+    SET "statement_timeout" TO '30min'
     AS $$
 DECLARE
     v_timezone text;
     v_first_order_created_at timestamptz;
     v_orders_per_month integer;
     v_cost_per_order_overage numeric;
-    v_month_start_utc timestamptz;
-    v_next_month_start_utc timestamptz;
     v_first_month_start_local timestamp;
     v_current_month_start_local timestamp;
-    v_processing_month_local timestamp;
-    v_min_date_local constant timestamp := '2015-01-01 00:00:00';
+    v_range_start_utc timestamptz;
+    v_range_end_utc timestamptz;
     v_total_orders integer := 0;
     v_total_batches integer := 0;
 BEGIN
@@ -3155,20 +3290,34 @@ BEGIN
         v_timezone := 'UTC';
     END IF;
 
-    -- Case 1: unlimited or pay-per-overage — every order should become visible.
+    -- Start clean so a rebuild is atomic and self-contained. This only ever runs
+    -- before any flipping has begun (the caller gates rebuilds on started_at).
+    DELETE FROM public.plan_visibility_change_job_orders WHERE job_id = p_job_id;
+    DELETE FROM public.plan_visibility_change_job_batches WHERE job_id = p_job_id;
+
+    -- Build the snapshot of intended flips. batch_index is computed inline (one
+    -- chronological window over the flipped set) instead of a second UPDATE pass,
+    -- and months are ranked with PARTITION BY instead of a month-by-month loop.
+    -- Both avoid joining the freshly-inserted (unanalysed) snapshot table back to
+    -- itself, which the planner was running as an O(n^2) nested loop.
+    -- orders.is_visible is flipped later, in chunks, by
+    -- apply_plan_visibility_change_flip_batch.
     IF v_orders_per_month IS NULL OR v_cost_per_order_overage IS NOT NULL THEN
-        WITH flipped AS (
-            UPDATE public.orders o
-            SET is_visible = 1
-            WHERE o.shop = p_shop
-              AND o.is_visible = 0
-            RETURNING o.id
-        )
+        -- Case 1: unlimited or pay-per-overage — every order should become visible.
         INSERT INTO public.plan_visibility_change_job_orders (job_id, batch_index, order_id, old_is_visible, new_is_visible)
-        SELECT p_job_id, 0, id, 0::smallint, 1::smallint FROM flipped;
+        SELECT
+            p_job_id,
+            ((row_number() OVER (ORDER BY o.order_created_at ASC, o.id ASC) - 1) / p_batch_size)::integer,
+            o.id,
+            0::smallint,
+            1::smallint
+        FROM public.orders o
+        WHERE o.shop = p_shop
+        AND o.is_visible = 0;
 
     ELSE
-        -- Case 2: fixed allowance — iterate month by month in the shop's timezone
+        -- Case 2: fixed allowance — the first v_orders_per_month orders of each
+        -- calendar month (in the shop's timezone) are visible, the rest hidden.
         v_first_order_created_at := COALESCE(v_first_order_created_at, now() - interval '12 months');
         IF v_first_order_created_at < '2015-01-01 00:00:00+00'::timestamptz THEN
             v_first_order_created_at := '2015-01-01 00:00:00+00'::timestamptz;
@@ -3176,60 +3325,43 @@ BEGIN
 
         v_first_month_start_local := date_trunc('month', (v_first_order_created_at AT TIME ZONE v_timezone))::timestamp;
         v_current_month_start_local := date_trunc('month', (now() AT TIME ZONE v_timezone))::timestamp;
-        v_processing_month_local := v_current_month_start_local;
 
-        WHILE v_processing_month_local >= v_first_month_start_local LOOP
-            v_month_start_utc := (v_processing_month_local AT TIME ZONE v_timezone);
-            v_next_month_start_utc := ((v_processing_month_local + interval '1 month') AT TIME ZONE v_timezone);
+        v_range_start_utc := (v_first_month_start_local AT TIME ZONE v_timezone);
+        v_range_end_utc := ((v_current_month_start_local + interval '1 month') AT TIME ZONE v_timezone);
 
-            WITH target_orders AS (
+        INSERT INTO public.plan_visibility_change_job_orders (job_id, batch_index, order_id, old_is_visible, new_is_visible)
+        SELECT
+            p_job_id,
+            ((row_number() OVER (ORDER BY flips.order_created_at ASC, flips.id ASC) - 1) / p_batch_size)::integer,
+            flips.id,
+            flips.old_visible,
+            flips.new_visible
+        FROM (
+            SELECT
+                ranked.id,
+                ranked.order_created_at,
+                ranked.old_visible,
+                ranked.new_visible
+            FROM (
                 SELECT
                     o.id,
+                    o.order_created_at,
                     o.is_visible AS old_visible,
                     CASE
-                        WHEN row_number() OVER (ORDER BY o.order_created_at ASC, o.id ASC) <= v_orders_per_month THEN 1
-                        ELSE 0
+                        WHEN row_number() OVER (
+                            PARTITION BY date_trunc('month', (o.order_created_at AT TIME ZONE v_timezone))
+                            ORDER BY o.order_created_at ASC, o.id ASC
+                        ) <= v_orders_per_month THEN 1::smallint
+                        ELSE 0::smallint
                     END AS new_visible
                 FROM public.orders o
                 WHERE o.shop = p_shop
-                  AND o.order_created_at >= v_month_start_utc
-                  AND o.order_created_at <  v_next_month_start_utc
-            ),
-            to_flip AS (
-                SELECT id, old_visible::smallint, new_visible::smallint
-                FROM target_orders
-                WHERE old_visible IS DISTINCT FROM new_visible
-            ),
-            flipped AS (
-                UPDATE public.orders o
-                SET is_visible = tf.new_visible
-                FROM to_flip tf
-                WHERE o.id = tf.id
-                RETURNING o.id, tf.old_visible, tf.new_visible
-            )
-            INSERT INTO public.plan_visibility_change_job_orders (job_id, batch_index, order_id, old_is_visible, new_is_visible)
-            SELECT p_job_id, 0, id, old_visible, new_visible FROM flipped;
-
-            v_processing_month_local := v_processing_month_local - interval '1 month';
-        END LOOP;
+                AND o.order_created_at >= v_range_start_utc
+                AND o.order_created_at <  v_range_end_utc
+            ) ranked
+            WHERE ranked.old_visible IS DISTINCT FROM ranked.new_visible
+        ) flips;
     END IF;
-
-    -- Assign batch indices CHRONOLOGICALLY by order_created_at so each batch
-    -- covers a contiguous date range. This lets the tinybird copy pipe use
-    -- tight date bounds for partition pruning.
-    WITH numbered AS (
-        SELECT
-            pvco.order_id,
-            ((row_number() OVER (ORDER BY o.order_created_at ASC, o.id ASC) - 1) / p_batch_size)::integer AS new_batch_index
-        FROM public.plan_visibility_change_job_orders pvco
-        JOIN public.orders o ON o.id = pvco.order_id
-        WHERE pvco.job_id = p_job_id
-    )
-    UPDATE public.plan_visibility_change_job_orders pvco
-    SET batch_index = numbered.new_batch_index
-    FROM numbered
-    WHERE pvco.job_id = p_job_id
-      AND pvco.order_id = numbered.order_id;
 
     -- Count results and create per-batch tracker rows WITH date bounds.
     SELECT COUNT(*)::integer INTO v_total_orders
@@ -3345,6 +3477,177 @@ $$;
 
 
 ALTER FUNCTION "public"."recalculate_order_attributions_for_order"("p_order_id" bigint, "p_client_id" "uuid", "p_order_created_at" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  r record; k jsonb; is_dup boolean;
+  kept jsonb := '[]'::jsonb; atc_count int := 0; cs_count int := 0;
+BEGIN
+  -- newest-first, mirroring app/utils/events.server.ts greedy dedup
+  FOR r IN
+    SELECT event_name, source::text AS source, current_page, client_id, event_ts
+    FROM shop_events
+    WHERE session_id = p_session_id
+      AND event_name IN ('product_added_to_cart', 'checkout_started')
+    ORDER BY event_ts DESC, id DESC
+  LOOP
+    is_dup := false;
+    FOR k IN SELECT * FROM jsonb_array_elements(kept) LOOP
+      IF  k->>'source'       IS DISTINCT FROM r.source
+      AND k->>'event_name'   =  r.event_name
+      AND r.client_id IS NOT NULL
+      AND k->>'client_id'    =  r.client_id::text
+      AND k->>'current_page' IS NOT DISTINCT FROM r.current_page
+      AND abs(extract(epoch FROM ((k->>'event_ts')::timestamptz - r.event_ts))) <= 30
+      THEN is_dup := true; EXIT; END IF;
+    END LOOP;
+
+    IF NOT is_dup THEN
+      kept := kept || jsonb_build_object(
+        'event_name', r.event_name, 'source', r.source,
+        'current_page', r.current_page, 'client_id', r.client_id, 'event_ts', r.event_ts);
+      IF r.event_name = 'product_added_to_cart'
+        THEN atc_count := atc_count + 1; ELSE cs_count := cs_count + 1; END IF;
+    END IF;
+  END LOOP;
+
+  UPDATE shop_sessions
+  SET number_of_add_to_carts = atc_count, number_of_checkout_starts = cs_count
+  WHERE id = p_session_id
+    AND (number_of_add_to_carts    IS DISTINCT FROM atc_count
+      OR number_of_checkout_starts IS DISTINCT FROM cs_count);
+END $$;
+
+
+ALTER FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) RETURNS integer
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  r record;
+  g_session uuid; g_name text; g_client uuid; g_page text;
+  have_group boolean := false;
+  min_kept_pixel timestamptz; min_kept_embed timestamptz;
+  is_dup boolean; updated_count int;
+BEGIN
+  -- p_event_upper is intentionally unused: we drive off the session_id index and
+  -- count ALL of each window-session's add-to-cart / checkout events (exact,
+  -- matching live recompute). Kept in the signature for call-site compatibility.
+  CREATE TEMP TABLE _kept (session_id uuid, event_name text) ON COMMIT DROP;
+
+  FOR r IN
+    SELECT s.id AS session_id, e.event_name, e.source::text AS source,
+            e.client_id, e.current_page, e.event_ts, e.id
+    FROM shop_sessions s
+    CROSS JOIN LATERAL (
+      SELECT ev.event_name, ev.source, ev.client_id, ev.current_page, ev.event_ts, ev.id
+      FROM shop_events ev
+      WHERE ev.session_id = s.id
+        AND ev.event_name IN ('product_added_to_cart','checkout_started')
+    ) e
+    WHERE s.shop = p_shop
+      AND s.started_at >= p_from
+      AND s.started_at <  p_to
+    ORDER BY s.id, e.event_name, e.client_id, e.current_page,
+              e.event_ts DESC, e.id DESC
+  LOOP
+    IF NOT have_group
+        OR g_session IS DISTINCT FROM r.session_id
+        OR g_name    IS DISTINCT FROM r.event_name
+        OR g_client  IS DISTINCT FROM r.client_id
+        OR g_page    IS DISTINCT FROM r.current_page THEN
+      have_group := true;
+      g_session := r.session_id; g_name := r.event_name;
+      g_client := r.client_id;   g_page := r.current_page;
+      min_kept_pixel := NULL; min_kept_embed := NULL;
+    END IF;
+
+    is_dup := false;
+    IF r.client_id IS NOT NULL THEN
+      IF r.source = 'PIXEL' THEN
+        is_dup := min_kept_embed IS NOT NULL AND min_kept_embed <= r.event_ts + interval '30 seconds';
+      ELSE
+        is_dup := min_kept_pixel IS NOT NULL AND min_kept_pixel <= r.event_ts + interval '30 seconds';
+      END IF;
+    END IF;
+
+    IF NOT is_dup THEN
+      IF r.source = 'PIXEL' THEN min_kept_pixel := r.event_ts;
+      ELSE                       min_kept_embed := r.event_ts; END IF;
+      INSERT INTO _kept VALUES (r.session_id, r.event_name);
+    END IF;
+  END LOOP;
+
+  WITH agg AS (
+    SELECT session_id,
+            count(*) FILTER (WHERE event_name = 'product_added_to_cart') AS atc,
+            count(*) FILTER (WHERE event_name = 'checkout_started')        AS cs
+    FROM _kept GROUP BY session_id
+  ),
+  upd AS (
+    UPDATE shop_sessions s
+    SET number_of_add_to_carts = agg.atc, number_of_checkout_starts = agg.cs
+    FROM agg
+    WHERE s.id = agg.session_id
+      AND (s.number_of_add_to_carts    IS DISTINCT FROM agg.atc
+        OR s.number_of_checkout_starts IS DISTINCT FROM agg.cs)
+    RETURNING 1
+  )
+  SELECT count(*) INTO updated_count FROM upd;
+
+  RETURN updated_count;
+END $$;
+
+
+ALTER FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") RETURNS "void"
+    LANGUAGE "plpgsql"
+    SET "statement_timeout" TO '5min'
+    AS $$
+BEGIN
+  INSERT INTO shop_performance_metrics (shop, month, revenue, ad_spend, currency_code, updated_at)
+  SELECT
+      p_shop,
+      COALESCE(r.month, sp.month) AS month,
+      COALESCE(r.revenue, 0) AS revenue,
+      COALESCE(sp.ad_spend, 0) AS ad_spend,
+      s.currency_code,
+      now()
+  FROM (
+      SELECT
+          date_trunc('month', o.order_created_at AT TIME ZONE (SELECT iana_timezone FROM shops WHERE shop = p_shop))::date AS month,
+          sum(o.shop_money_order_amount) AS revenue
+      FROM orders o
+      WHERE o.shop = p_shop
+      GROUP BY 1
+  ) r
+  FULL OUTER JOIN (
+      SELECT
+          date_trunc('month', m.date_in_shop_tz)::date AS month,
+          sum(m.spend_shop_currency) AS ad_spend
+      FROM ad_campaign_external_metrics m
+      WHERE m.shop = p_shop
+      GROUP BY 1
+  ) sp ON sp.month = r.month
+  CROSS JOIN shops s
+  WHERE s.shop = p_shop
+  ON CONFLICT (shop, month) DO UPDATE SET
+      revenue = EXCLUDED.revenue,
+      ad_spend = EXCLUDED.ad_spend,
+      currency_code = EXCLUDED.currency_code,
+      updated_at = EXCLUDED.updated_at;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."rollup_ad_external_metrics"() RETURNS "trigger"
@@ -3953,6 +4256,20 @@ ALTER TABLE "public"."bulk_fetch_jobs" ALTER COLUMN "id" ADD GENERATED BY DEFAUL
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."cancellation_responses" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "reason" "text" NOT NULL,
+    "alternative_shown" "text",
+    "action_taken" "text" NOT NULL,
+    "feedback_text" "text"
+);
+
+
+ALTER TABLE "public"."cancellation_responses" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."changelog_entries" (
     "id" bigint NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4046,6 +4363,18 @@ ALTER TABLE "public"."connected_platforms" ALTER COLUMN "id" ADD GENERATED BY DE
     CACHE 1
 );
 
+
+
+CREATE TABLE IF NOT EXISTS "public"."contact_events" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "contacted_email" "text" NOT NULL,
+    "email_type" "text" NOT NULL
+);
+
+
+ALTER TABLE "public"."contact_events" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."currency_conversion_rates" (
@@ -4206,6 +4535,48 @@ CREATE TABLE IF NOT EXISTS "public"."flow_watermarks" (
 ALTER TABLE "public"."flow_watermarks" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."integration_backfill_jobs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "shop_integration_id" bigint,
+    "integration_key" "text" NOT NULL,
+    "status" "public"."STORE_SETUP_STATUS" DEFAULT 'PENDING'::"public"."STORE_SETUP_STATUS" NOT NULL,
+    "backfill_from" timestamp with time zone NOT NULL,
+    "cursor" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "total_items" integer,
+    "processed_items" integer DEFAULT 0 NOT NULL,
+    "matched_items" integer DEFAULT 0 NOT NULL,
+    "unmatched_items" integer DEFAULT 0 NOT NULL,
+    "started_at" timestamp with time zone,
+    "finished_at" timestamp with time zone,
+    "error_message" "text"
+);
+
+
+ALTER TABLE "public"."integration_backfill_jobs" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."integration_order_items" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "integration_key" "text" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "external_number" "text",
+    "order_id" bigint,
+    "platform_order_id" "text",
+    "status" "text",
+    "amounts" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "currency_code" "text" DEFAULT 'USD'::"text" NOT NULL,
+    "external_created_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."integration_order_items" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."landing_pages" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4348,6 +4719,24 @@ CREATE TABLE IF NOT EXISTS "public"."order_batch_download_jobs" (
 ALTER TABLE "public"."order_batch_download_jobs" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."order_costs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "order_id" bigint NOT NULL,
+    "order_created_at" timestamp with time zone NOT NULL,
+    "category" "public"."COST_CATEGORY" NOT NULL,
+    "source" "public"."COST_SOURCE" NOT NULL,
+    "amount" numeric(18,6) NOT NULL,
+    "currency_code" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "order_costs_amount_non_negative" CHECK (("amount" >= (0)::numeric))
+);
+
+
+ALTER TABLE "public"."order_costs" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."order_download_jobs" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4432,7 +4821,6 @@ CREATE TABLE IF NOT EXISTS "public"."orders" (
     "customer_name" "text",
     "customer_shopify_id" "text",
     "checkout_token" "text",
-    "visible" boolean DEFAULT false NOT NULL,
     "financial_status" "text",
     "fulfillment_status" "text",
     "first_visit" "jsonb",
@@ -4696,6 +5084,48 @@ CREATE TABLE IF NOT EXISTS "public"."shop_clients" (
 ALTER TABLE "public"."shop_clients" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."shop_costs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "name" "text" NOT NULL,
+    "category" "public"."COST_CATEGORY" NOT NULL,
+    "source" "public"."COST_SOURCE" DEFAULT 'MANUAL'::"public"."COST_SOURCE" NOT NULL,
+    "cost_type" "public"."SHOP_COST_TYPE" NOT NULL,
+    "amount" numeric(18,6) NOT NULL,
+    "currency_code" "text",
+    "recurring_interval" "public"."COST_RECURRING_INTERVAL",
+    "effective_from" "date" NOT NULL,
+    "effective_to" "date",
+    "scope" "public"."SHOP_COST_SCOPE" DEFAULT 'STORE'::"public"."SHOP_COST_SCOPE" NOT NULL,
+    "utm_source_match_type" "public"."UTM_SET_COST_MATCH_TYPE" DEFAULT 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE" NOT NULL,
+    "utm_source_value" "text",
+    "utm_medium_match_type" "public"."UTM_SET_COST_MATCH_TYPE" DEFAULT 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE" NOT NULL,
+    "utm_medium_value" "text",
+    "utm_campaign_match_type" "public"."UTM_SET_COST_MATCH_TYPE" DEFAULT 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE" NOT NULL,
+    "utm_campaign_value" "text",
+    "utm_content_match_type" "public"."UTM_SET_COST_MATCH_TYPE" DEFAULT 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE" NOT NULL,
+    "utm_content_value" "text",
+    "utm_term_match_type" "public"."UTM_SET_COST_MATCH_TYPE" DEFAULT 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE" NOT NULL,
+    "utm_term_value" "text",
+    "ad_campaign_id" bigint,
+    "ad_set_id" bigint,
+    "ad_id" bigint,
+    "enabled" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "shop_costs_amount_positive" CHECK (("amount" > (0)::numeric)),
+    CONSTRAINT "shop_costs_currency_check" CHECK (((("cost_type" = 'PERCENT_AD_SPEND'::"public"."SHOP_COST_TYPE") AND ("currency_code" IS NULL)) OR (("cost_type" <> 'PERCENT_AD_SPEND'::"public"."SHOP_COST_TYPE") AND ("currency_code" IS NOT NULL)))),
+    CONSTRAINT "shop_costs_effective_range_check" CHECK ((("effective_to" IS NULL) OR ("effective_to" >= "effective_from"))),
+    CONSTRAINT "shop_costs_per_click_scope_check" CHECK ((("cost_type" <> 'PER_CLICK'::"public"."SHOP_COST_TYPE") OR ("scope" = 'UTM'::"public"."SHOP_COST_SCOPE"))),
+    CONSTRAINT "shop_costs_recurring_interval_check" CHECK ((("cost_type" = 'RECURRING'::"public"."SHOP_COST_TYPE") = ("recurring_interval" IS NOT NULL))),
+    CONSTRAINT "shop_costs_scope_ids_check" CHECK (((("ad_campaign_id" IS NOT NULL) = ("scope" = 'AD_CAMPAIGN'::"public"."SHOP_COST_SCOPE")) AND (("ad_set_id" IS NOT NULL) = ("scope" = 'AD_SET'::"public"."SHOP_COST_SCOPE")) AND (("ad_id" IS NOT NULL) = ("scope" = 'AD'::"public"."SHOP_COST_SCOPE")))),
+    CONSTRAINT "shop_costs_scope_utm_check" CHECK ((("scope" = 'UTM'::"public"."SHOP_COST_SCOPE") = (("utm_source_match_type" <> 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE") OR ("utm_source_value" IS NOT NULL) OR ("utm_medium_match_type" <> 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE") OR ("utm_medium_value" IS NOT NULL) OR ("utm_campaign_match_type" <> 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE") OR ("utm_campaign_value" IS NOT NULL) OR ("utm_content_match_type" <> 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE") OR ("utm_content_value" IS NOT NULL) OR ("utm_term_match_type" <> 'WILDCARD'::"public"."UTM_SET_COST_MATCH_TYPE") OR ("utm_term_value" IS NOT NULL))))
+);
+
+
+ALTER TABLE "public"."shop_costs" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."shop_delayed_events_to_process" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4730,6 +5160,45 @@ CREATE TABLE IF NOT EXISTS "public"."shop_events" (
 ALTER TABLE "public"."shop_events" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."shop_integrations" (
+    "id" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "shop" "text" NOT NULL,
+    "integration_key" "text" NOT NULL,
+    "connection_information" "jsonb" NOT NULL,
+    "status" "public"."CONNECTED_ACCOUNT_STATUS" DEFAULT 'PENDING'::"public"."CONNECTED_ACCOUNT_STATUS" NOT NULL,
+    "last_synced_at" timestamp with time zone
+);
+
+
+ALTER TABLE "public"."shop_integrations" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."shop_integrations" ALTER COLUMN "id" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."shop_integrations_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."shop_performance_metrics" (
+    "shop" "text" NOT NULL,
+    "month" "date" NOT NULL,
+    "revenue" numeric DEFAULT 0 NOT NULL,
+    "ad_spend" numeric DEFAULT 0 NOT NULL,
+    "currency_code" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."shop_performance_metrics" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."shop_sessions" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
@@ -4742,7 +5211,10 @@ CREATE TABLE IF NOT EXISTS "public"."shop_sessions" (
     "landing_page_id" "uuid",
     "user_agent" "text",
     "ip_address" "text",
-    "referer" "text"
+    "referer" "text",
+    "number_of_add_to_carts" integer DEFAULT 0 NOT NULL,
+    "number_of_checkout_starts" integer DEFAULT 0 NOT NULL,
+    "channel" "text" DEFAULT ''::"text" NOT NULL
 );
 
 ALTER TABLE ONLY "public"."shop_sessions" REPLICA IDENTITY FULL;
@@ -4817,8 +5289,17 @@ CREATE TABLE IF NOT EXISTS "public"."shopify_sessions" (
     "isOnline" boolean NOT NULL,
     "scope" character varying(1024),
     "expires" integer,
-    "onlineAccessInfo" character varying(255),
-    "accessToken" character varying(255)
+    "accessToken" character varying(255),
+    "refreshToken" character varying(255),
+    "refreshTokenExpires" bigint,
+    "userId" bigint,
+    "firstName" character varying(255),
+    "lastName" character varying(255),
+    "email" character varying(255),
+    "accountOwner" boolean,
+    "locale" character varying(255),
+    "collaborator" boolean,
+    "emailVerified" boolean
 );
 
 
@@ -4863,11 +5344,37 @@ CREATE TABLE IF NOT EXISTS "public"."shops" (
     "shopify_plus" boolean,
     "is_partner_development_plan" boolean,
     "production_host" "text",
+    "vertical" "text",
+    "app_install_landing_page" "text",
+    "app_install_utm_source" "text",
+    "app_install_utm_medium" "text",
+    "app_install_utm_campaign" "text",
+    "app_install_utm_term" "text",
+    "app_install_utm_content" "text",
+    "app_install_surface_type" "text",
+    "app_install_surface_detail" "text",
+    "seen_dashboard_with_attributions" timestamp with time zone,
+    "dormant_at" timestamp with time zone,
+    "cancelled_via_flow_at" timestamp with time zone,
     CONSTRAINT "shops_hash_rotate_hour_utc_check" CHECK (("hash_rotate_hour_utc" <= 23))
 );
 
 
 ALTER TABLE "public"."shops" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."subscription_payments" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "subscription_id" bigint NOT NULL,
+    "shop" "text" NOT NULL,
+    "billing_period_start" timestamp with time zone NOT NULL,
+    "currency_code" "text" NOT NULL,
+    "amount" numeric
+);
+
+
+ALTER TABLE "public"."subscription_payments" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."subscriptions" (
@@ -5183,6 +5690,11 @@ ALTER TABLE ONLY "public"."bulk_fetch_jobs"
 
 
 
+ALTER TABLE ONLY "public"."cancellation_responses"
+    ADD CONSTRAINT "cancellation_responses_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."changelog_entries"
     ADD CONSTRAINT "changelog_entry_pkey" PRIMARY KEY ("id");
 
@@ -5210,6 +5722,11 @@ ALTER TABLE ONLY "public"."connected_platforms"
 
 ALTER TABLE ONLY "public"."connected_platforms"
     ADD CONSTRAINT "connected_platforms_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."contact_events"
+    ADD CONSTRAINT "contact_events_pkey" PRIMARY KEY ("id");
 
 
 
@@ -5265,6 +5782,21 @@ ALTER TABLE ONLY "public"."feature_flag_records"
 
 ALTER TABLE ONLY "public"."flow_watermarks"
     ADD CONSTRAINT "flow_watermarks_pkey" PRIMARY KEY ("slot");
+
+
+
+ALTER TABLE ONLY "public"."integration_backfill_jobs"
+    ADD CONSTRAINT "integration_backfill_jobs_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."integration_order_items"
+    ADD CONSTRAINT "integration_order_items_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."integration_order_items"
+    ADD CONSTRAINT "integration_order_items_unique" UNIQUE ("shop", "integration_key", "external_id");
 
 
 
@@ -5325,6 +5857,16 @@ ALTER TABLE ONLY "public"."order_attributions"
 
 ALTER TABLE ONLY "public"."order_batch_download_jobs"
     ADD CONSTRAINT "order_batch_download_job_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."order_costs"
+    ADD CONSTRAINT "order_costs_order_category_source_key" UNIQUE ("order_id", "category", "source");
+
+
+
+ALTER TABLE ONLY "public"."order_costs"
+    ADD CONSTRAINT "order_costs_pkey" PRIMARY KEY ("id");
 
 
 
@@ -5453,6 +5995,11 @@ ALTER TABLE ONLY "public"."shop_clients"
 
 
 
+ALTER TABLE ONLY "public"."shop_costs"
+    ADD CONSTRAINT "shop_costs_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."shop_delayed_events_to_process"
     ADD CONSTRAINT "shop_delayed_events_to_process_pkey" PRIMARY KEY ("id");
 
@@ -5470,6 +6017,21 @@ ALTER TABLE ONLY "public"."shop_events"
 
 ALTER TABLE ONLY "public"."shop_events"
     ADD CONSTRAINT "shop_events_shopify_id_key" UNIQUE ("shopify_id");
+
+
+
+ALTER TABLE ONLY "public"."shop_integrations"
+    ADD CONSTRAINT "shop_integrations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."shop_integrations"
+    ADD CONSTRAINT "shop_integrations_shop_key_key" UNIQUE ("shop", "integration_key");
+
+
+
+ALTER TABLE ONLY "public"."shop_performance_metrics"
+    ADD CONSTRAINT "shop_performance_metrics_pkey" PRIMARY KEY ("shop", "month");
 
 
 
@@ -5515,6 +6077,16 @@ ALTER TABLE ONLY "public"."shops"
 
 ALTER TABLE ONLY "public"."shop_setup_jobs"
     ADD CONSTRAINT "store_setup_job_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."subscription_payments"
+    ADD CONSTRAINT "subscription_payments_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."subscription_payments"
+    ADD CONSTRAINT "subscription_payments_subscription_id_billing_period_start_key" UNIQUE ("subscription_id", "billing_period_start");
 
 
 
@@ -5582,6 +6154,10 @@ CREATE INDEX "connected_platforms_connectable_account_id_shop_connection__idx" O
 
 
 
+CREATE UNIQUE INDEX "contact_events_shop_email_type_key" ON "public"."contact_events" USING "btree" ("shop", "email_type");
+
+
+
 CREATE INDEX "data_export_jobs_shop_created_at_idx" ON "public"."data_export_jobs" USING "btree" ("shop", "created_at" DESC);
 
 
@@ -5642,6 +6218,10 @@ CREATE INDEX "idx_bulk_fetch_jobs_shop" ON "public"."bulk_fetch_jobs" USING "btr
 
 
 
+CREATE INDEX "idx_cancellation_responses_shop" ON "public"."cancellation_responses" USING "btree" ("shop");
+
+
+
 CREATE INDEX "idx_changelog_entries_date_desc_show_in_app_true" ON "public"."changelog_entries" USING "btree" ("date" DESC) WHERE ("show_in_app" IS TRUE);
 
 
@@ -5675,6 +6255,18 @@ CREATE INDEX "idx_failed_embedded_events_shop_created" ON "public"."failed_embed
 
 
 CREATE INDEX "idx_failed_embedded_events_unprocessed" ON "public"."failed_embed_events" USING "btree" ("created_at") WHERE ("processed_at" IS NULL);
+
+
+
+CREATE INDEX "idx_integration_backfill_jobs_shop_created_at" ON "public"."integration_backfill_jobs" USING "btree" ("shop", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_integration_order_items_order_id" ON "public"."integration_order_items" USING "btree" ("order_id");
+
+
+
+CREATE INDEX "idx_integration_order_items_unmatched" ON "public"."integration_order_items" USING "btree" ("shop", "integration_key") WHERE ("order_id" IS NULL);
 
 
 
@@ -5719,6 +6311,14 @@ CREATE INDEX "idx_order_attr_by_source" ON "public"."order_attributions" USING "
 
 
 CREATE INDEX "idx_order_attributions_landing_page_id" ON "public"."order_attributions" USING "btree" ("landing_page_id");
+
+
+
+CREATE INDEX "idx_order_costs_order_id" ON "public"."order_costs" USING "btree" ("order_id");
+
+
+
+CREATE INDEX "idx_order_costs_shop_order_created_at" ON "public"."order_costs" USING "btree" ("shop", "order_created_at");
 
 
 
@@ -5770,6 +6370,10 @@ CREATE INDEX "idx_sessions_shop_src_time_incl" ON "public"."shop_sessions" USING
 
 
 
+CREATE INDEX "idx_shop_costs_shop" ON "public"."shop_costs" USING "btree" ("shop");
+
+
+
 CREATE INDEX "idx_shop_events_session_id" ON "public"."shop_events" USING "btree" ("session_id");
 
 
@@ -5794,6 +6398,14 @@ CREATE INDEX "idx_shop_events_traffic_source_id" ON "public"."shop_events" USING
 
 
 
+CREATE INDEX "idx_shop_integrations_shop" ON "public"."shop_integrations" USING "btree" ("shop");
+
+
+
+CREATE INDEX "idx_shop_sessions_landing_page_started" ON "public"."shop_sessions" USING "btree" ("landing_page_id", "started_at");
+
+
+
 CREATE INDEX "idx_shop_sessions_shop" ON "public"."shop_sessions" USING "btree" ("shop");
 
 
@@ -5811,6 +6423,10 @@ CREATE INDEX "idx_shop_sessions_traffic_source_id" ON "public"."shop_sessions" U
 
 
 CREATE INDEX "idx_shop_users_shop" ON "public"."shop_users" USING "btree" ("shop");
+
+
+
+CREATE INDEX "idx_subscription_payments_subscription_id" ON "public"."subscription_payments" USING "btree" ("subscription_id");
 
 
 
@@ -6044,6 +6660,11 @@ ALTER TABLE ONLY "public"."attributed_orders_export_jobs"
 
 
 
+ALTER TABLE ONLY "public"."cancellation_responses"
+    ADD CONSTRAINT "cancellation_responses_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop");
+
+
+
 ALTER TABLE ONLY "public"."checkout_sessions"
     ADD CONSTRAINT "checkout_sessions_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON DELETE CASCADE;
 
@@ -6114,6 +6735,26 @@ ALTER TABLE ONLY "public"."feature_flag_records"
 
 
 
+ALTER TABLE ONLY "public"."integration_backfill_jobs"
+    ADD CONSTRAINT "integration_backfill_jobs_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."integration_backfill_jobs"
+    ADD CONSTRAINT "integration_backfill_jobs_shop_integration_id_fkey" FOREIGN KEY ("shop_integration_id") REFERENCES "public"."shop_integrations"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."integration_order_items"
+    ADD CONSTRAINT "integration_order_items_order_id_fkey" FOREIGN KEY ("order_id") REFERENCES "public"."orders"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."integration_order_items"
+    ADD CONSTRAINT "integration_order_items_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."landing_pages"
     ADD CONSTRAINT "landing_pages_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop");
 
@@ -6161,6 +6802,16 @@ ALTER TABLE ONLY "public"."order_attributions"
 
 ALTER TABLE ONLY "public"."order_batch_download_jobs"
     ADD CONSTRAINT "order_batch_download_job_order_download_job_id_fkey" FOREIGN KEY ("order_download_job_id") REFERENCES "public"."order_download_jobs"("id");
+
+
+
+ALTER TABLE ONLY "public"."order_costs"
+    ADD CONSTRAINT "order_costs_order_id_fkey" FOREIGN KEY ("order_id") REFERENCES "public"."orders"("id") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."order_costs"
+    ADD CONSTRAINT "order_costs_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON DELETE CASCADE;
 
 
 
@@ -6264,6 +6915,26 @@ ALTER TABLE ONLY "public"."shop_anonymous_clients"
 
 
 
+ALTER TABLE ONLY "public"."shop_costs"
+    ADD CONSTRAINT "shop_costs_ad_campaign_id_fkey" FOREIGN KEY ("ad_campaign_id") REFERENCES "public"."ad_campaigns"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."shop_costs"
+    ADD CONSTRAINT "shop_costs_ad_id_fkey" FOREIGN KEY ("ad_id") REFERENCES "public"."ads"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."shop_costs"
+    ADD CONSTRAINT "shop_costs_ad_set_id_fkey" FOREIGN KEY ("ad_set_id") REFERENCES "public"."ad_sets"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."shop_costs"
+    ADD CONSTRAINT "shop_costs_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."shop_delayed_events_to_process"
     ADD CONSTRAINT "shop_delayed_events_to_process_shop_event_id_fkey" FOREIGN KEY ("shop_event_id") REFERENCES "public"."shop_events"("id");
 
@@ -6281,6 +6952,16 @@ ALTER TABLE ONLY "public"."shop_events"
 
 ALTER TABLE ONLY "public"."shop_events"
     ADD CONSTRAINT "shop_events_traffic_source_id_fkey" FOREIGN KEY ("traffic_source_id") REFERENCES "public"."traffic_sources"("id");
+
+
+
+ALTER TABLE ONLY "public"."shop_integrations"
+    ADD CONSTRAINT "shop_integrations_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."shop_performance_metrics"
+    ADD CONSTRAINT "shop_performance_metrics_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop");
 
 
 
@@ -6321,6 +7002,16 @@ ALTER TABLE ONLY "public"."shops"
 
 ALTER TABLE ONLY "public"."shop_setup_jobs"
     ADD CONSTRAINT "store_setup_job_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop");
+
+
+
+ALTER TABLE ONLY "public"."subscription_payments"
+    ADD CONSTRAINT "subscription_payments_shop_fkey" FOREIGN KEY ("shop") REFERENCES "public"."shops"("shop");
+
+
+
+ALTER TABLE ONLY "public"."subscription_payments"
+    ADD CONSTRAINT "subscription_payments_subscription_id_fkey" FOREIGN KEY ("subscription_id") REFERENCES "public"."subscriptions"("id");
 
 
 
@@ -6463,7 +7154,15 @@ ALTER PUBLICATION "flow_publication" ADD TABLE ONLY "public"."order_attributions
 
 
 
+ALTER PUBLICATION "flow_publication" ADD TABLE ONLY "public"."order_costs";
+
+
+
 ALTER PUBLICATION "flow_publication" ADD TABLE ONLY "public"."orders";
+
+
+
+ALTER PUBLICATION "flow_publication" ADD TABLE ONLY "public"."shop_costs";
 
 
 
@@ -6491,6 +7190,7 @@ GRANT USAGE ON SCHEMA "public" TO "anon";
 GRANT USAGE ON SCHEMA "public" TO "authenticated";
 GRANT USAGE ON SCHEMA "public" TO "service_role";
 GRANT USAGE ON SCHEMA "public" TO "debezium";
+GRANT ALL ON SCHEMA "public" TO "prisma";
 
 
 
@@ -6684,282 +7384,364 @@ REVOKE ALL ON FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "
 GRANT ALL ON FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "p_min_age" interval, "p_limit" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "p_min_age" interval, "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "p_min_age" interval, "p_limit" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."admin_kill_app_sessions"("p_app_name" "text", "p_min_age" interval, "p_limit" integer) TO "prisma";
+
+
+
+GRANT ALL ON FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."apply_plan_visibility_change_flip_batch"("p_job_id" "uuid", "p_batch_size" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."backfill_ads_summary_spend_shop_currency_for_shops"() TO "anon";
 GRANT ALL ON FUNCTION "public"."backfill_ads_summary_spend_shop_currency_for_shops"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_ads_summary_spend_shop_currency_for_shops"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."backfill_ads_summary_spend_shop_currency_for_shops"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."backfill_converting_session_id_batch"("p_shop" "text", "p_batch_size" integer, "p_after_id" bigint) TO "anon";
 GRANT ALL ON FUNCTION "public"."backfill_converting_session_id_batch"("p_shop" "text", "p_batch_size" integer, "p_after_id" bigint) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_converting_session_id_batch"("p_shop" "text", "p_batch_size" integer, "p_after_id" bigint) TO "service_role";
+GRANT ALL ON FUNCTION "public"."backfill_converting_session_id_batch"("p_shop" "text", "p_batch_size" integer, "p_after_id" bigint) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."backfill_shop_events_client_id"("p_batch_size" integer, "p_pause_ms" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."backfill_shop_events_client_id"("p_batch_size" integer, "p_pause_ms" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_shop_events_client_id"("p_batch_size" integer, "p_pause_ms" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."backfill_shop_events_client_id"("p_batch_size" integer, "p_pause_ms" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."backfill_summary_zero_values"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "anon";
 GRANT ALL ON FUNCTION "public"."backfill_summary_zero_values"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."backfill_summary_zero_values"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."backfill_summary_zero_values"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."bulk_create_past_order_attributions_from_shopify_id"("p_order_ids" "text"[], "p_shop_url" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."bulk_create_past_order_attributions_from_shopify_id"("p_order_ids" "text"[], "p_shop_url" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bulk_create_past_order_attributions_from_shopify_id"("p_order_ids" "text"[], "p_shop_url" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."bulk_create_past_order_attributions_from_shopify_id"("p_order_ids" "text"[], "p_shop_url" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "service_role";
+GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop_batch"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop_batch"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop_batch"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "service_role";
+GRANT ALL ON FUNCTION "public"."bulk_insert_customer_first_orders_for_shop_batch"("p_shop" "text", "p_batch_size" integer, "p_sleep_ms" numeric) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."bulk_update_orders_source_name"("p_orders" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."bulk_update_orders_source_name"("p_orders" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bulk_update_orders_source_name"("p_orders" "jsonb") TO "service_role";
+GRANT ALL ON FUNCTION "public"."bulk_update_orders_source_name"("p_orders" "jsonb") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."calculate_shop_ad_hierarchies_summary"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "anon";
 GRANT ALL ON FUNCTION "public"."calculate_shop_ad_hierarchies_summary"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."calculate_shop_ad_hierarchies_summary"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."calculate_shop_ad_hierarchies_summary"("p_shop" "text", "p_start_date" "date", "p_end_date" "date") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone) TO "service_role";
+GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone, "p_allowance" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone, "p_allowance" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone, "p_allowance" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."carry_forward_order_count_on_plan_change"("p_shop" "text", "p_old_billing_period_end" timestamp with time zone, "p_new_billing_period_start" timestamp with time zone, "p_new_billing_period_end" timestamp with time zone, "p_allowance" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."claim_order_overage_batch"("p_shop" "text", "p_billing_period_end" timestamp with time zone, "p_limit" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."claim_order_overage_batch"("p_shop" "text", "p_billing_period_end" timestamp with time zone, "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."claim_order_overage_batch"("p_shop" "text", "p_billing_period_end" timestamp with time zone, "p_limit" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."claim_order_overage_batch"("p_shop" "text", "p_billing_period_end" timestamp with time zone, "p_limit" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."delete_shop_data"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_shop_data"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_shop_data"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_shop_data"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_1"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_1"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_1"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_shop_data_part_1"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2_batch"("p_shop" "text", "p_batch_size" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2_batch"("p_shop" "text", "p_batch_size" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2_batch"("p_shop" "text", "p_batch_size" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_shop_data_part_2_batch"("p_shop" "text", "p_batch_size" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."delete_shop_sessions_by_ids"("p_session_ids" "uuid"[]) TO "anon";
 GRANT ALL ON FUNCTION "public"."delete_shop_sessions_by_ids"("p_session_ids" "uuid"[]) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."delete_shop_sessions_by_ids"("p_session_ids" "uuid"[]) TO "service_role";
+GRANT ALL ON FUNCTION "public"."delete_shop_sessions_by_ids"("p_session_ids" "uuid"[]) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."enqueue_order_overages_for_shop_period"("p_shop" "text", "p_billing_period_start" timestamp with time zone, "p_billing_period_end" timestamp with time zone, "p_allowance" integer, "p_max_new_orders" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."enqueue_order_overages_for_shop_period"("p_shop" "text", "p_billing_period_start" timestamp with time zone, "p_billing_period_end" timestamp with time zone, "p_allowance" integer, "p_max_new_orders" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."enqueue_order_overages_for_shop_period"("p_shop" "text", "p_billing_period_start" timestamp with time zone, "p_billing_period_end" timestamp with time zone, "p_allowance" integer, "p_max_new_orders" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."enqueue_order_overages_for_shop_period"("p_shop" "text", "p_billing_period_start" timestamp with time zone, "p_billing_period_end" timestamp with time zone, "p_allowance" integer, "p_max_new_orders" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_ads"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."export_ads"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_ads"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_ads"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_ads_summary"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."export_ads_summary"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_ads_summary"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_ads_summary"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_all_ad_campaigns"() TO "anon";
 GRANT ALL ON FUNCTION "public"."export_all_ad_campaigns"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_all_ad_campaigns"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_all_ad_campaigns"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_all_ad_sets"() TO "anon";
 GRANT ALL ON FUNCTION "public"."export_all_ad_sets"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_all_ad_sets"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_all_ad_sets"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_all_ads"() TO "anon";
 GRANT ALL ON FUNCTION "public"."export_all_ads"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_all_ads"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_all_ads"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_all_traffic_sources"() TO "anon";
 GRANT ALL ON FUNCTION "public"."export_all_traffic_sources"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_all_traffic_sources"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_all_traffic_sources"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_sessions"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."export_sessions"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_sessions"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_sessions"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_touches_summary"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."export_touches_summary"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_touches_summary"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_touches_summary"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."export_traffic_sources"("p_shop" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."export_traffic_sources"("p_shop" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."export_traffic_sources"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."export_traffic_sources"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."fetch_grouped_utm_sets_v3"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_limit" integer, "p_offset" integer, "p_utm_source" "text", "p_utm_campaign" "text", "p_utm_medium" "text", "p_utm_content" "text", "p_utm_term" "text", "p_search_term" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."fetch_grouped_utm_sets_v3"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_limit" integer, "p_offset" integer, "p_utm_source" "text", "p_utm_campaign" "text", "p_utm_medium" "text", "p_utm_content" "text", "p_utm_term" "text", "p_search_term" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fetch_grouped_utm_sets_v3"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_limit" integer, "p_offset" integer, "p_utm_source" "text", "p_utm_campaign" "text", "p_utm_medium" "text", "p_utm_content" "text", "p_utm_term" "text", "p_search_term" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."fetch_grouped_utm_sets_v3"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_limit" integer, "p_offset" integer, "p_utm_source" "text", "p_utm_campaign" "text", "p_utm_medium" "text", "p_utm_content" "text", "p_utm_term" "text", "p_search_term" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."find_duplicate_shop_sessions_to_remove"("p_limit" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."find_duplicate_shop_sessions_to_remove"("p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."find_duplicate_shop_sessions_to_remove"("p_limit" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."find_duplicate_shop_sessions_to_remove"("p_limit" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."find_or_create_session_locked"("p_lock_key" "text", "p_shop" "text", "p_unique_hash" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."find_or_create_session_locked"("p_lock_key" "text", "p_shop" "text", "p_unique_hash" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."find_or_create_session_locked"("p_lock_key" "text", "p_shop" "text", "p_unique_hash" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."find_or_create_session_locked"("p_lock_key" "text", "p_shop" "text", "p_unique_hash" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "prisma";
 
 
 
-GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text", "p_channel" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text", "p_channel" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text", "p_channel" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."find_or_create_session_locked_v2"("p_lock_key" "text", "p_shop" "text", "p_landing_page" "text", "p_landing_page_id" "uuid", "p_traffic_source_id" "uuid", "p_event_timestamp" timestamp with time zone, "p_is_landing_page" boolean, "p_unique_hash" "text", "p_client_id" "uuid", "p_user_agent" "text", "p_ip_address" "text", "p_referer" "text", "p_channel" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."find_or_create_shop_user_session"("p_shop_user_id" bigint, "p_inactivity_threshold_seconds" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."find_or_create_shop_user_session"("p_shop_user_id" bigint, "p_inactivity_threshold_seconds" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."find_or_create_shop_user_session"("p_shop_user_id" bigint, "p_inactivity_threshold_seconds" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."find_or_create_shop_user_session"("p_shop_user_id" bigint, "p_inactivity_threshold_seconds" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."fix_landing_pages_normalization_batch"("p_shop" "text", "p_limit" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."fix_landing_pages_normalization_batch"("p_shop" "text", "p_limit" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fix_landing_pages_normalization_batch"("p_shop" "text", "p_limit" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."fix_landing_pages_normalization_batch"("p_shop" "text", "p_limit" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."get_monthly_order_counts"("p_shop" "text", "p_timezone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_monthly_order_counts"("p_shop" "text", "p_timezone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_monthly_order_counts"("p_shop" "text", "p_timezone" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_monthly_order_counts"("p_shop" "text", "p_timezone" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."get_order_totals"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."get_order_totals"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_order_totals"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_order_totals"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."get_touches_summary_for_shop"("p_shop" "text", "p_date_from" "date", "p_date_to" "date") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_touches_summary_for_shop"("p_shop" "text", "p_date_from" "date", "p_date_to" "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_touches_summary_for_shop"("p_shop" "text", "p_date_from" "date", "p_date_to" "date") TO "service_role";
+GRANT ALL ON FUNCTION "public"."get_touches_summary_for_shop"("p_shop" "text", "p_date_from" "date", "p_date_to" "date") TO "prisma";
+
+
+
+GRANT ALL ON FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."increment_session_event_count"("p_session_id" "uuid", "p_add_to_carts" integer, "p_checkout_starts" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch"("p_shop" "text", "p_batch_size" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch"("p_shop" "text", "p_batch_size" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch"("p_shop" "text", "p_batch_size" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch"("p_shop" "text", "p_batch_size" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch_skip"("p_shop" "text", "p_batch_size" integer, "p_skip" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch_skip"("p_shop" "text", "p_batch_size" integer, "p_skip" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch_skip"("p_shop" "text", "p_batch_size" integer, "p_skip" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."make_shop_orders_visible_batch_skip"("p_shop" "text", "p_batch_size" integer, "p_skip" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."mark_first_orders_visible_date_range"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_order_limit" integer, "p_timezone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."mark_first_orders_visible_date_range"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_order_limit" integer, "p_timezone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."mark_first_orders_visible_date_range"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_order_limit" integer, "p_timezone" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."mark_first_orders_visible_date_range"("p_shop" "text", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone, "p_order_limit" integer, "p_timezone" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."prepare_plan_visibility_change_job"("p_shop" "text", "p_job_id" "uuid", "p_batch_size" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."prepare_plan_visibility_change_job"("p_shop" "text", "p_job_id" "uuid", "p_batch_size" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."prepare_plan_visibility_change_job"("p_shop" "text", "p_job_id" "uuid", "p_batch_size" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."prepare_plan_visibility_change_job"("p_shop" "text", "p_job_id" "uuid", "p_batch_size" integer) TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."recalculate_order_attributions_for_order"("p_order_id" bigint, "p_client_id" "uuid", "p_order_created_at" timestamp with time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."recalculate_order_attributions_for_order"("p_order_id" bigint, "p_client_id" "uuid", "p_order_created_at" timestamp with time zone) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."recalculate_order_attributions_for_order"("p_order_id" bigint, "p_client_id" "uuid", "p_order_created_at" timestamp with time zone) TO "service_role";
+GRANT ALL ON FUNCTION "public"."recalculate_order_attributions_for_order"("p_order_id" bigint, "p_client_id" "uuid", "p_order_created_at" timestamp with time zone) TO "prisma";
+
+
+
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts"("p_session_id" "uuid") TO "prisma";
+
+
+
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) TO "service_role";
+GRANT ALL ON FUNCTION "public"."recompute_session_event_counts_bulk"("p_shop" "text", "p_from" timestamp with time zone, "p_to" timestamp with time zone, "p_event_upper" timestamp with time zone) TO "prisma";
+
+
+
+GRANT ALL ON FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."refresh_shop_performance_metrics"("p_shop" "text") TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics"() TO "anon";
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics_update"() TO "anon";
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics_update"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics_update"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."rollup_ad_external_metrics_update"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."tg_set_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."tg_set_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."tg_set_updated_at"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."tg_set_updated_at"() TO "prisma";
 
 
 
 GRANT ALL ON FUNCTION "public"."update_order_status"("p_shop" "text", "p_order_id" "text", "p_financial_status" "text", "p_fulfillment_status" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."update_order_status"("p_shop" "text", "p_order_id" "text", "p_financial_status" "text", "p_fulfillment_status" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_order_status"("p_shop" "text", "p_order_id" "text", "p_financial_status" "text", "p_fulfillment_status" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."update_order_status"("p_shop" "text", "p_order_id" "text", "p_financial_status" "text", "p_fulfillment_status" "text") TO "prisma";
 
 
 
@@ -6984,216 +7766,266 @@ GRANT ALL ON FUNCTION "public"."update_order_status"("p_shop" "text", "p_order_i
 GRANT ALL ON TABLE "public"."ad_account_sync_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."ad_account_sync_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_account_sync_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_account_sync_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_campaign_external_metrics" TO "anon";
 GRANT ALL ON TABLE "public"."ad_campaign_external_metrics" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_campaign_external_metrics" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_campaign_external_metrics" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_campaigns" TO "anon";
 GRANT ALL ON TABLE "public"."ad_campaigns" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_campaigns" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_campaigns" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ad_campaigns_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_campaigns_summary" TO "anon";
 GRANT ALL ON TABLE "public"."ad_campaigns_summary" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_campaigns_summary" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_campaigns_summary" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_summary_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_summary_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ad_campaigns_summary_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ad_campaigns_summary_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_external_metrics" TO "anon";
 GRANT ALL ON TABLE "public"."ad_external_metrics" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_external_metrics" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_external_metrics" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_set_external_metrics" TO "anon";
 GRANT ALL ON TABLE "public"."ad_set_external_metrics" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_set_external_metrics" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_set_external_metrics" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_sets" TO "anon";
 GRANT ALL ON TABLE "public"."ad_sets" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_sets" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_sets" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ad_sets_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ad_sets_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ad_sets_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ad_sets_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ad_sets_summary" TO "anon";
 GRANT ALL ON TABLE "public"."ad_sets_summary" TO "authenticated";
 GRANT ALL ON TABLE "public"."ad_sets_summary" TO "service_role";
+GRANT ALL ON TABLE "public"."ad_sets_summary" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ad_sets_summary_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ad_sets_summary_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ad_sets_summary_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ad_sets_summary_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ads" TO "anon";
 GRANT ALL ON TABLE "public"."ads" TO "authenticated";
 GRANT ALL ON TABLE "public"."ads" TO "service_role";
+GRANT ALL ON TABLE "public"."ads" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ads_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ads_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ads_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ads_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."ads_summary" TO "anon";
 GRANT ALL ON TABLE "public"."ads_summary" TO "authenticated";
 GRANT ALL ON TABLE "public"."ads_summary" TO "service_role";
+GRANT ALL ON TABLE "public"."ads_summary" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."ads_summary_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."ads_summary_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."ads_summary_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."ads_summary_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."attributed_orders_export_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."attributed_orders_export_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."attributed_orders_export_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."attributed_orders_export_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."bulk_fetch_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."bulk_fetch_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."bulk_fetch_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."bulk_fetch_jobs" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."bulk_fetch_jobs_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."bulk_fetch_jobs_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."bulk_fetch_jobs_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."bulk_fetch_jobs_id_seq" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."cancellation_responses" TO "anon";
+GRANT ALL ON TABLE "public"."cancellation_responses" TO "authenticated";
+GRANT ALL ON TABLE "public"."cancellation_responses" TO "service_role";
+GRANT ALL ON TABLE "public"."cancellation_responses" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."changelog_entries" TO "anon";
 GRANT ALL ON TABLE "public"."changelog_entries" TO "authenticated";
 GRANT ALL ON TABLE "public"."changelog_entries" TO "service_role";
+GRANT ALL ON TABLE "public"."changelog_entries" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."changelog_entry_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."changelog_entry_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."changelog_entry_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."changelog_entry_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."checkout_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."checkout_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."checkout_sessions" TO "service_role";
+GRANT ALL ON TABLE "public"."checkout_sessions" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."connectable_platforms" TO "anon";
 GRANT ALL ON TABLE "public"."connectable_platforms" TO "authenticated";
 GRANT ALL ON TABLE "public"."connectable_platforms" TO "service_role";
+GRANT ALL ON TABLE "public"."connectable_platforms" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."connectable_platforms_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."connectable_platforms_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."connectable_platforms_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."connectable_platforms_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."connected_platforms" TO "anon";
 GRANT ALL ON TABLE "public"."connected_platforms" TO "authenticated";
 GRANT ALL ON TABLE "public"."connected_platforms" TO "service_role";
+GRANT ALL ON TABLE "public"."connected_platforms" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."connected_platforms_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."connected_platforms_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."connected_platforms_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."connected_platforms_id_seq" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."contact_events" TO "anon";
+GRANT ALL ON TABLE "public"."contact_events" TO "authenticated";
+GRANT ALL ON TABLE "public"."contact_events" TO "service_role";
+GRANT ALL ON TABLE "public"."contact_events" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."currency_conversion_rates" TO "anon";
 GRANT ALL ON TABLE "public"."currency_conversion_rates" TO "authenticated";
 GRANT ALL ON TABLE "public"."currency_conversion_rates" TO "service_role";
+GRANT ALL ON TABLE "public"."currency_conversion_rates" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."customer_first_orders" TO "anon";
 GRANT ALL ON TABLE "public"."customer_first_orders" TO "authenticated";
 GRANT ALL ON TABLE "public"."customer_first_orders" TO "service_role";
+GRANT ALL ON TABLE "public"."customer_first_orders" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."customer_tag_applications" TO "anon";
 GRANT ALL ON TABLE "public"."customer_tag_applications" TO "authenticated";
 GRANT ALL ON TABLE "public"."customer_tag_applications" TO "service_role";
+GRANT ALL ON TABLE "public"."customer_tag_applications" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."customer_tag_rules" TO "anon";
 GRANT ALL ON TABLE "public"."customer_tag_rules" TO "authenticated";
 GRANT ALL ON TABLE "public"."customer_tag_rules" TO "service_role";
+GRANT ALL ON TABLE "public"."customer_tag_rules" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."data_export_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."data_export_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."data_export_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."data_export_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."early_access_requests" TO "anon";
 GRANT ALL ON TABLE "public"."early_access_requests" TO "authenticated";
 GRANT ALL ON TABLE "public"."early_access_requests" TO "service_role";
+GRANT ALL ON TABLE "public"."early_access_requests" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."early_access_request_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."early_access_request_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."early_access_request_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."early_access_request_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."failed_embed_events" TO "anon";
 GRANT ALL ON TABLE "public"."failed_embed_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."failed_embed_events" TO "service_role";
+GRANT ALL ON TABLE "public"."failed_embed_events" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."failed_events" TO "anon";
 GRANT ALL ON TABLE "public"."failed_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."failed_events" TO "service_role";
+GRANT ALL ON TABLE "public"."failed_events" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."feature_flag_records" TO "anon";
 GRANT ALL ON TABLE "public"."feature_flag_records" TO "authenticated";
 GRANT ALL ON TABLE "public"."feature_flag_records" TO "service_role";
+GRANT ALL ON TABLE "public"."feature_flag_records" TO "prisma";
 
 
 
@@ -7201,90 +8033,126 @@ GRANT ALL ON TABLE "public"."flow_watermarks" TO "anon";
 GRANT ALL ON TABLE "public"."flow_watermarks" TO "authenticated";
 GRANT ALL ON TABLE "public"."flow_watermarks" TO "service_role";
 GRANT ALL ON TABLE "public"."flow_watermarks" TO "flow_capture";
+GRANT ALL ON TABLE "public"."flow_watermarks" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."integration_backfill_jobs" TO "anon";
+GRANT ALL ON TABLE "public"."integration_backfill_jobs" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_backfill_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."integration_backfill_jobs" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."integration_order_items" TO "anon";
+GRANT ALL ON TABLE "public"."integration_order_items" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_order_items" TO "service_role";
+GRANT ALL ON TABLE "public"."integration_order_items" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."landing_pages" TO "anon";
 GRANT ALL ON TABLE "public"."landing_pages" TO "authenticated";
 GRANT ALL ON TABLE "public"."landing_pages" TO "service_role";
+GRANT ALL ON TABLE "public"."landing_pages" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."landing_pages_summary_daily" TO "anon";
 GRANT ALL ON TABLE "public"."landing_pages_summary_daily" TO "authenticated";
 GRANT ALL ON TABLE "public"."landing_pages_summary_daily" TO "service_role";
+GRANT ALL ON TABLE "public"."landing_pages_summary_daily" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."line_items" TO "anon";
 GRANT ALL ON TABLE "public"."line_items" TO "authenticated";
 GRANT ALL ON TABLE "public"."line_items" TO "service_role";
+GRANT ALL ON TABLE "public"."line_items" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."line_items_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."line_items_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."line_items_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."line_items_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."mandatory_webhooks" TO "anon";
 GRANT ALL ON TABLE "public"."mandatory_webhooks" TO "authenticated";
 GRANT ALL ON TABLE "public"."mandatory_webhooks" TO "service_role";
+GRANT ALL ON TABLE "public"."mandatory_webhooks" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."mandatory_webhooks_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."mandatory_webhooks_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."mandatory_webhooks_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."mandatory_webhooks_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."named_sources" TO "anon";
 GRANT ALL ON TABLE "public"."named_sources" TO "authenticated";
 GRANT ALL ON TABLE "public"."named_sources" TO "service_role";
+GRANT ALL ON TABLE "public"."named_sources" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_attribution_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."order_attribution_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_attribution_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."order_attribution_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_attributions" TO "anon";
 GRANT ALL ON TABLE "public"."order_attributions" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_attributions" TO "service_role";
+GRANT ALL ON TABLE "public"."order_attributions" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_batch_download_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."order_batch_download_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_batch_download_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."order_batch_download_jobs" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."order_costs" TO "anon";
+GRANT ALL ON TABLE "public"."order_costs" TO "authenticated";
+GRANT ALL ON TABLE "public"."order_costs" TO "service_role";
+GRANT ALL ON TABLE "public"."order_costs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_download_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."order_download_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_download_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."order_download_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_export_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."order_export_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_export_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."order_export_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_overage_records" TO "anon";
 GRANT ALL ON TABLE "public"."order_overage_records" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_overage_records" TO "service_role";
+GRANT ALL ON TABLE "public"."order_overage_records" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."order_totals_daily" TO "anon";
 GRANT ALL ON TABLE "public"."order_totals_daily" TO "authenticated";
 GRANT ALL ON TABLE "public"."order_totals_daily" TO "service_role";
+GRANT ALL ON TABLE "public"."order_totals_daily" TO "prisma";
 
 
 
@@ -7292,264 +8160,343 @@ GRANT ALL ON TABLE "public"."orders" TO "anon";
 GRANT ALL ON TABLE "public"."orders" TO "authenticated";
 GRANT ALL ON TABLE "public"."orders" TO "service_role";
 GRANT SELECT ON TABLE "public"."orders" TO "debezium";
+GRANT ALL ON TABLE "public"."orders" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."orders_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."orders_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."orders_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."orders_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."orphan_ad_account_sync_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."orphan_ad_account_sync_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."orphan_ad_account_sync_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."orphan_ad_account_sync_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."orphan_plan_modify_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."orphan_plan_modify_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."orphan_plan_modify_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."orphan_plan_modify_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."plan_change_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."plan_change_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."plan_change_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."plan_change_jobs" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."plan_change_jobs_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."plan_change_jobs_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."plan_change_jobs_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."plan_change_jobs_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."plan_modify_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."plan_modify_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."plan_modify_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."plan_modify_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_batches" TO "anon";
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_batches" TO "authenticated";
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_batches" TO "service_role";
+GRANT ALL ON TABLE "public"."plan_visibility_change_job_batches" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_orders" TO "anon";
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_orders" TO "authenticated";
 GRANT ALL ON TABLE "public"."plan_visibility_change_job_orders" TO "service_role";
+GRANT ALL ON TABLE "public"."plan_visibility_change_job_orders" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."plan_visibility_change_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."plan_visibility_change_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."plan_visibility_change_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."plan_visibility_change_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."platform_accounts" TO "anon";
 GRANT ALL ON TABLE "public"."platform_accounts" TO "authenticated";
 GRANT ALL ON TABLE "public"."platform_accounts" TO "service_role";
+GRANT ALL ON TABLE "public"."platform_accounts" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."platform_accounts_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."platform_accounts_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."platform_accounts_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."platform_accounts_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."replication_slot_alerts" TO "anon";
 GRANT ALL ON TABLE "public"."replication_slot_alerts" TO "authenticated";
 GRANT ALL ON TABLE "public"."replication_slot_alerts" TO "service_role";
+GRANT ALL ON TABLE "public"."replication_slot_alerts" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."replication_slot_alerts_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."replication_slot_alerts_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."replication_slot_alerts_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."replication_slot_alerts_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."report_requests" TO "anon";
 GRANT ALL ON TABLE "public"."report_requests" TO "authenticated";
 GRANT ALL ON TABLE "public"."report_requests" TO "service_role";
+GRANT ALL ON TABLE "public"."report_requests" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."report_request_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."report_request_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."report_request_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."report_request_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."saved_utm_set_export_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."saved_utm_set_export_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."saved_utm_set_export_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."saved_utm_set_export_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_anonymous_clients" TO "anon";
 GRANT ALL ON TABLE "public"."shop_anonymous_clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_anonymous_clients" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_anonymous_clients" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_billing_period_counters" TO "anon";
 GRANT ALL ON TABLE "public"."shop_billing_period_counters" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_billing_period_counters" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_billing_period_counters" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_clients" TO "anon";
 GRANT ALL ON TABLE "public"."shop_clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_clients" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_clients" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."shop_costs" TO "anon";
+GRANT ALL ON TABLE "public"."shop_costs" TO "authenticated";
+GRANT ALL ON TABLE "public"."shop_costs" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_costs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_delayed_events_to_process" TO "anon";
 GRANT ALL ON TABLE "public"."shop_delayed_events_to_process" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_delayed_events_to_process" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_delayed_events_to_process" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_events" TO "anon";
 GRANT ALL ON TABLE "public"."shop_events" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_events" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_events" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."shop_integrations" TO "anon";
+GRANT ALL ON TABLE "public"."shop_integrations" TO "authenticated";
+GRANT ALL ON TABLE "public"."shop_integrations" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_integrations" TO "prisma";
+
+
+
+GRANT ALL ON SEQUENCE "public"."shop_integrations_id_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."shop_integrations_id_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."shop_integrations_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."shop_integrations_id_seq" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."shop_performance_metrics" TO "anon";
+GRANT ALL ON TABLE "public"."shop_performance_metrics" TO "authenticated";
+GRANT ALL ON TABLE "public"."shop_performance_metrics" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_performance_metrics" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."shop_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_sessions" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_sessions" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_setup_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."shop_setup_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_setup_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_setup_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_user_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."shop_user_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_user_sessions" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_user_sessions" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shop_users" TO "anon";
 GRANT ALL ON TABLE "public"."shop_users" TO "authenticated";
 GRANT ALL ON TABLE "public"."shop_users" TO "service_role";
+GRANT ALL ON TABLE "public"."shop_users" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."shop_users_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."shop_users_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."shop_users_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."shop_users_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shopify_sessions" TO "anon";
 GRANT ALL ON TABLE "public"."shopify_sessions" TO "authenticated";
 GRANT ALL ON TABLE "public"."shopify_sessions" TO "service_role";
+GRANT ALL ON TABLE "public"."shopify_sessions" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shopify_sessions_migrations" TO "anon";
 GRANT ALL ON TABLE "public"."shopify_sessions_migrations" TO "authenticated";
 GRANT ALL ON TABLE "public"."shopify_sessions_migrations" TO "service_role";
+GRANT ALL ON TABLE "public"."shopify_sessions_migrations" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."shops" TO "anon";
 GRANT ALL ON TABLE "public"."shops" TO "authenticated";
 GRANT ALL ON TABLE "public"."shops" TO "service_role";
+GRANT ALL ON TABLE "public"."shops" TO "prisma";
+
+
+
+GRANT ALL ON TABLE "public"."subscription_payments" TO "anon";
+GRANT ALL ON TABLE "public"."subscription_payments" TO "authenticated";
+GRANT ALL ON TABLE "public"."subscription_payments" TO "service_role";
+GRANT ALL ON TABLE "public"."subscription_payments" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."subscriptions" TO "anon";
 GRANT ALL ON TABLE "public"."subscriptions" TO "authenticated";
 GRANT ALL ON TABLE "public"."subscriptions" TO "service_role";
+GRANT ALL ON TABLE "public"."subscriptions" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."subscriptions_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."subscriptions_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."subscriptions_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."subscriptions_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."traffic_source_group_utm_sets" TO "anon";
 GRANT ALL ON TABLE "public"."traffic_source_group_utm_sets" TO "authenticated";
 GRANT ALL ON TABLE "public"."traffic_source_group_utm_sets" TO "service_role";
+GRANT ALL ON TABLE "public"."traffic_source_group_utm_sets" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."traffic_source_groups" TO "anon";
 GRANT ALL ON TABLE "public"."traffic_source_groups" TO "authenticated";
 GRANT ALL ON TABLE "public"."traffic_source_groups" TO "service_role";
+GRANT ALL ON TABLE "public"."traffic_source_groups" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."traffic_sources" TO "anon";
 GRANT ALL ON TABLE "public"."traffic_sources" TO "authenticated";
 GRANT ALL ON TABLE "public"."traffic_sources" TO "service_role";
+GRANT ALL ON TABLE "public"."traffic_sources" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."utm_notepad_preset_values" TO "anon";
 GRANT ALL ON TABLE "public"."utm_notepad_preset_values" TO "authenticated";
 GRANT ALL ON TABLE "public"."utm_notepad_preset_values" TO "service_role";
+GRANT ALL ON TABLE "public"."utm_notepad_preset_values" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."utm_notepad_preset_value_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."utm_notepad_preset_value_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."utm_notepad_preset_value_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."utm_notepad_preset_value_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."utm_set_cost_rules" TO "anon";
 GRANT ALL ON TABLE "public"."utm_set_cost_rules" TO "authenticated";
 GRANT ALL ON TABLE "public"."utm_set_cost_rules" TO "service_role";
+GRANT ALL ON TABLE "public"."utm_set_cost_rules" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."utm_set_export_jobs" TO "anon";
 GRANT ALL ON TABLE "public"."utm_set_export_jobs" TO "authenticated";
 GRANT ALL ON TABLE "public"."utm_set_export_jobs" TO "service_role";
+GRANT ALL ON TABLE "public"."utm_set_export_jobs" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."utm_sets" TO "anon";
 GRANT ALL ON TABLE "public"."utm_sets" TO "authenticated";
 GRANT ALL ON TABLE "public"."utm_sets" TO "service_role";
+GRANT ALL ON TABLE "public"."utm_sets" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."utm_sets_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."utm_sets_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."utm_sets_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."utm_sets_id_seq" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."v_cnt" TO "anon";
 GRANT ALL ON TABLE "public"."v_cnt" TO "authenticated";
 GRANT ALL ON TABLE "public"."v_cnt" TO "service_role";
+GRANT ALL ON TABLE "public"."v_cnt" TO "prisma";
 
 
 
 GRANT ALL ON TABLE "public"."web_pixels" TO "anon";
 GRANT ALL ON TABLE "public"."web_pixels" TO "authenticated";
 GRANT ALL ON TABLE "public"."web_pixels" TO "service_role";
+GRANT ALL ON TABLE "public"."web_pixels" TO "prisma";
 
 
 
 GRANT ALL ON SEQUENCE "public"."web_pixel_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."web_pixel_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."web_pixel_id_seq" TO "service_role";
+GRANT ALL ON SEQUENCE "public"."web_pixel_id_seq" TO "prisma";
 
 
 
@@ -7557,6 +8504,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQ
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "service_role";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES  TO "prisma";
 
 
 
@@ -7567,6 +8515,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUN
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "service_role";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS  TO "prisma";
 
 
 
@@ -7577,6 +8526,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "anon";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "authenticated";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "service_role";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "prisma";
 
 
 

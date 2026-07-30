@@ -1,146 +1,94 @@
-import { isSuperActive } from "./activity";
-import type { ShopProfile, ShopWithRevenue } from "./insights";
+import { cache } from "react";
 
-export type Segment = {
-  label: string;
-  shops: Array<ShopWithRevenue>;
-};
+import { supabase } from "@/lib/supabase";
+import { tinybirdQuery } from "@/lib/tinybird";
 
-const ageInDays = (timestamp: string | null) => {
-  if (!timestamp) {
-    return null;
-  }
-  return (Date.now() - new Date(timestamp).getTime()) / 86400000;
-};
+import { getShopSessionCounts } from "./activity";
+import { toUsd } from "./currencies";
 
-const tenureInDays = (shop: ShopProfile) => {
-  return ageInDays(shop.initialInstalledAt);
-};
+export const BASELINE_MIN_MONTHS = 6;
+export const IDEAL_MIN_SESSIONS = 12;
 
-const installToUninstallDays = (shop: ShopProfile) => {
-  if (!shop.initialInstalledAt || !shop.uninstalledAt) {
-    return null;
-  }
-  const diff =
-    new Date(shop.uninstalledAt).getTime() -
-    new Date(shop.initialInstalledAt).getTime();
-  return diff / 86400000;
-};
+const DAYS_PER_MONTH = 30.4375;
+const PAGE_SIZE = 1000;
 
-export const isChampion = (shop: ShopWithRevenue) => {
-  const tenure = tenureInDays(shop);
-  if (tenure === null || tenure < 90) {
-    return false;
-  }
-  if (!shop.isPaying) {
-    return false;
-  }
-  if (!shop.isInstalled) {
-    return false;
-  }
-  if (shop.revenue90d <= 0) {
-    return false;
-  }
-  if (!isSuperActive(shop)) {
-    return false;
-  }
-  return true;
-};
-
-export const isEarlyChurner = (shop: ShopProfile) => {
-  if (shop.isInstalled) {
-    return false;
-  }
-  const lifespan = installToUninstallDays(shop);
-  if (lifespan === null) {
-    return false;
-  }
-  return lifespan <= 30;
-};
-
-export type ScorecardDimension = {
-  key: string;
-  label: string;
-  group: string;
-  buckets: Array<{
-    label: string;
-    championPct: number;
-    churnerPct: number;
-    allPct: number;
-    delta: number;
-  }>;
-};
-
-const distribute = <T>(
-  shops: Array<T>,
-  classify: (shop: T) => string | null,
-): Map<string, number> => {
-  const counts = new Map<string, number>();
-  for (const shop of shops) {
-    const key = classify(shop);
-    if (key === null) {
-      continue;
-    }
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  return counts;
-};
-
-const buildDimension = (params: {
-  key: string;
-  label: string;
-  group: string;
-  bucketOrder: Array<string>;
-  champions: Array<ShopWithRevenue>;
-  churners: Array<ShopProfile>;
-  baseline: Array<ShopProfile>;
-  classifyChampion: (shop: ShopWithRevenue) => string | null;
-  classifyChurner: (shop: ShopProfile) => string | null;
-  classifyBaseline: (shop: ShopProfile) => string | null;
-}): ScorecardDimension => {
-  const champCounts = distribute(params.champions, params.classifyChampion);
-  const churnCounts = distribute(params.churners, params.classifyChurner);
-  const allCounts = distribute(params.baseline, params.classifyBaseline);
-  const champTotal = Array.from(champCounts.values()).reduce(
-    (s, n) => s + n,
-    0,
-  );
-  const churnTotal = Array.from(churnCounts.values()).reduce(
-    (s, n) => s + n,
-    0,
-  );
-  const allTotal = Array.from(allCounts.values()).reduce((s, n) => s + n, 0);
-
-  const allBuckets = Array.from(
-    new Set([
-      ...params.bucketOrder,
-      ...champCounts.keys(),
-      ...churnCounts.keys(),
-      ...allCounts.keys(),
-    ]),
-  );
-
-  const buckets = allBuckets.map((bucket) => {
-    const championPct =
-      champTotal > 0 ? (champCounts.get(bucket) ?? 0) / champTotal : 0;
-    const churnerPct =
-      churnTotal > 0 ? (churnCounts.get(bucket) ?? 0) / churnTotal : 0;
-    const allPct = allTotal > 0 ? (allCounts.get(bucket) ?? 0) / allTotal : 0;
-    return {
-      label: bucket,
-      championPct,
-      churnerPct,
-      allPct,
-      delta: championPct - churnerPct,
-    };
-  });
-
-  return {
-    key: params.key,
-    label: params.label,
-    group: params.group,
-    buckets: buckets.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)),
+type RawShopData = {
+  plan?: {
+    displayName?: string;
+    shopifyPlus?: boolean;
+    partnerDevelopment?: boolean;
   };
+};
+
+const parseShopData = (raw: unknown): RawShopData | null => {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  return raw as RawShopData;
+};
+
+type IcpShop = {
+  shop: string;
+  isInstalled: boolean;
+  mrr: number;
+  tenureMonths: number;
+  orderCountAtInstall: number | null;
+  vertical: string | null;
+  shopifyPlanName: string | null;
+  shopifyPlus: boolean;
+  isPartnerDev: boolean;
+  referralChannel: string;
+  originPlanKey: string | null;
+  setupCompleted: boolean;
+  adPlatformCount: number;
+  monthlyRevenue: number | null;
+  monthlyAdSpend: number | null;
+  ordersPerMonth: number;
+};
+
+const monthsBetween = (from: Date, to: Date) => {
+  return (to.getTime() - from.getTime()) / (DAYS_PER_MONTH * 86400000);
+};
+
+const titleCase = (value: string) => {
+  return value
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+};
+
+// "How did they get to us" — prefer an explicit UTM source, fall back to a
+// paid-click marker, then the Shopify app-store surface, then organic.
+const referralChannel = (row: {
+  app_install_utm_source: string | null;
+  app_install_fbclid: string | null;
+  app_install_gclid: string | null;
+  app_install_surface_type: string | null;
+}): string => {
+  if (row.app_install_utm_source) {
+    return titleCase(row.app_install_utm_source);
+  }
+  if (row.app_install_fbclid) {
+    return "Meta (paid)";
+  }
+  if (row.app_install_gclid) {
+    return "Google (paid)";
+  }
+  if (row.app_install_surface_type) {
+    return titleCase(row.app_install_surface_type);
+  }
+  return "Direct / organic";
+};
+
+const shopifyPlanLabel = (shop: IcpShop): string => {
+  if (shop.shopifyPlus) {
+    return "Plus";
+  }
+  if (shop.isPartnerDev) {
+    return "Partner dev";
+  }
+  return shop.shopifyPlanName ?? "unknown";
 };
 
 const orderCountBucket = (count: number | null) => {
@@ -159,436 +107,599 @@ const orderCountBucket = (count: number | null) => {
   if (count < 10_000) {
     return "1k–10k";
   }
-  if (count < 100_000) {
-    return "10k–100k";
-  }
-  return "100k+";
+  return "10k+";
 };
 
-const timeToPixelBucket = (shop: ShopProfile) => {
-  if (!shop.originPixelAddedAt) {
-    return "never";
-  }
-  const start = shop.lastInstalledAt ?? shop.initialInstalledAt;
-  if (!start) {
+const monthlyRevenueBucket = (amount: number | null) => {
+  if (amount === null) {
     return "unknown";
   }
-  const diff =
-    new Date(shop.originPixelAddedAt).getTime() - new Date(start).getTime();
-  const hours = diff / 3_600_000;
-  if (hours < 0) {
-    return "before install";
+  if (amount < 1) {
+    return "$0";
   }
-  if (hours < 1) {
-    return "<1h";
+  if (amount < 1_000) {
+    return "<$1k";
   }
-  if (hours < 24) {
-    return "1–24h";
+  if (amount < 10_000) {
+    return "$1k–$10k";
   }
-  const days = hours / 24;
-  if (days < 7) {
-    return "1–7d";
+  if (amount < 50_000) {
+    return "$10k–$50k";
   }
-  if (days < 30) {
-    return "7–30d";
+  if (amount < 200_000) {
+    return "$50k–$200k";
   }
-  return "30d+";
+  return "$200k+";
 };
 
-const yesNo = (predicate: boolean) => {
-  return predicate ? "yes" : "no";
-};
-
-const hasAnyAd = (shop: ShopProfile) => {
-  return shop.connectedPlatformKeys.length > 0;
-};
-
-const installSource = (shop: ShopProfile) => {
-  if (shop.installFbclid) {
-    return "Meta ad click";
+const monthlyAdSpendBucket = (amount: number | null) => {
+  if (amount === null) {
+    return "unknown";
   }
-  if (shop.installGclid) {
-    return "Google ad click";
+  if (amount < 1) {
+    return "$0";
   }
-  return "organic / direct";
+  if (amount < 500) {
+    return "<$500";
+  }
+  if (amount < 2_500) {
+    return "$500–$2.5k";
+  }
+  if (amount < 10_000) {
+    return "$2.5k–$10k";
+  }
+  return "$10k+";
 };
 
-export type ICPScorecard = {
-  championCount: number;
-  earlyChurnerCount: number;
+const ordersPerMonthBucket = (count: number) => {
+  if (count < 1) {
+    return "0";
+  }
+  if (count < 50) {
+    return "1–49";
+  }
+  if (count < 200) {
+    return "50–199";
+  }
+  if (count < 1_000) {
+    return "200–999";
+  }
+  return "1k+";
+};
+
+const adPlatformBucket = (count: number) => {
+  if (count === 0) {
+    return "0";
+  }
+  if (count === 1) {
+    return "1";
+  }
+  return "2+";
+};
+
+const median = (values: Array<number>) => {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+};
+
+export type IcpBucket = {
+  label: string;
+  idealCount: number;
+  notIdealCount: number;
+  idealPct: number;
+  notIdealPct: number;
+  delta: number;
+};
+
+export type IcpDimension = {
+  key: string;
+  label: string;
+  note: string;
+  buckets: Array<IcpBucket>;
+};
+
+const MAX_BUCKETS = 8;
+
+const distribute = (
+  shops: Array<IcpShop>,
+  classify: (shop: IcpShop) => string,
+): Map<string, number> => {
+  const counts = new Map<string, number>();
+  for (const shop of shops) {
+    const key = classify(shop);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+};
+
+const buildDimension = (params: {
+  key: string;
+  label: string;
+  note: string;
+  bucketOrder: Array<string>;
+  // Ordinal dimensions (size bands) keep their declared bucket order;
+  // categorical ones sort by delta so the strongest signal is on top.
+  sortByDelta?: boolean;
+  ideal: Array<IcpShop>;
+  notIdeal: Array<IcpShop>;
+  classify: (shop: IcpShop) => string;
+}): IcpDimension => {
+  const idealCounts = distribute(params.ideal, params.classify);
+  const notIdealCounts = distribute(params.notIdeal, params.classify);
+  const idealTotal = params.ideal.length;
+  const notIdealTotal = params.notIdeal.length;
+
+  const labels = Array.from(
+    new Set([
+      ...params.bucketOrder,
+      ...idealCounts.keys(),
+      ...notIdealCounts.keys(),
+    ]),
+  );
+
+  const buckets = labels.map((label) => {
+    const idealCount = idealCounts.get(label) ?? 0;
+    const notIdealCount = notIdealCounts.get(label) ?? 0;
+    const idealPct = idealTotal > 0 ? idealCount / idealTotal : 0;
+    const notIdealPct = notIdealTotal > 0 ? notIdealCount / notIdealTotal : 0;
+    return {
+      label,
+      idealCount,
+      notIdealCount,
+      idealPct,
+      notIdealPct,
+      delta: idealPct - notIdealPct,
+    };
+  });
+
+  const ordered =
+    params.sortByDelta === false
+      ? buckets
+      : buckets.sort((a, b) => b.delta - a.delta);
+
+  return {
+    key: params.key,
+    label: params.label,
+    note: params.note,
+    buckets: ordered.slice(0, MAX_BUCKETS),
+  };
+};
+
+type RawSubscription = {
+  id: number;
+  shop: string;
+  plan_key: string | null;
+  price: number | null;
+  activated_at: string | null;
+  has_completed_setup: boolean;
+};
+
+const fetchAllSubscriptions = async (): Promise<Array<RawSubscription>> => {
+  const subscriptions: Array<RawSubscription> = [];
+  let from = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const { data: page, error: subscriptionsError } = await supabase
+      .from("subscriptions")
+      .select(`
+        id,
+        shop,
+        plan_key,
+        price,
+        activated_at,
+        has_completed_setup
+      `)
+      .order("id", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (subscriptionsError) {
+      console.error("Error fetching subscriptions", subscriptionsError);
+      throw subscriptionsError;
+    }
+
+    subscriptions.push(...page);
+
+    hasMore = page.length === PAGE_SIZE;
+    from += PAGE_SIZE;
+  }
+
+  return subscriptions;
+};
+
+type MonthlyAverages = {
+  monthlyRevenue: number;
+  monthlyAdSpend: number;
+};
+
+// Average monthly revenue + ad spend (USD) per shop across every month in the
+// shop_performance_metrics rollup. Rows are deleted on uninstall, so shops
+// without rows come back absent, not zero.
+const fetchMonthlyAverages = async (): Promise<Map<string, MonthlyAverages>> => {
+  type RawRow = {
+    shop: string;
+    revenue: number;
+    ad_spend: number;
+    currency_code: string;
+  };
+
+  const rows: Array<RawRow> = [];
+  let from = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    const { data: page, error: metricsError } = await supabase
+      .from("shop_performance_metrics")
+      .select(`
+        shop,
+        revenue,
+        ad_spend,
+        currency_code
+      `)
+      .order("shop", { ascending: true })
+      .order("month", { ascending: true })
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (metricsError) {
+      console.error("Error fetching shop performance metrics", metricsError);
+      throw metricsError;
+    }
+
+    rows.push(...page);
+
+    hasMore = page.length === PAGE_SIZE;
+    from += PAGE_SIZE;
+  }
+
+  type Totals = { revenue: number; adSpend: number; months: number };
+  const totalsByShop = new Map<string, Totals>();
+
+  for (const row of rows) {
+    const totals = totalsByShop.get(row.shop) ?? {
+      revenue: 0,
+      adSpend: 0,
+      months: 0,
+    };
+    totals.revenue += toUsd(row.revenue, row.currency_code);
+    totals.adSpend += toUsd(row.ad_spend, row.currency_code);
+    totals.months += 1;
+    totalsByShop.set(row.shop, totals);
+  }
+
+  const averages = new Map<string, MonthlyAverages>();
+  for (const [shop, totals] of totalsByShop) {
+    averages.set(shop, {
+      monthlyRevenue: totals.revenue / totals.months,
+      monthlyAdSpend: totals.adSpend / totals.months,
+    });
+  }
+
+  return averages;
+};
+
+// Tracked orders over the trailing 90 days per shop. The orders table is a CDC
+// replica with duplicate rows per order, so dedupe by id before counting.
+const fetchOrders90d = async (): Promise<Map<string, number>> => {
+  type RawOrderRow = {
+    shop: string;
+    orders: string;
+  };
+
+  const sql = `
+    SELECT
+      shop,
+      count() AS orders
+    FROM (
+      SELECT
+        id,
+        shop,
+        argMax(_is_deleted, updated_at) AS del,
+        argMax(is_visible, updated_at) AS vis
+      FROM orders
+      WHERE order_created_at >= today() - INTERVAL 90 DAY
+      GROUP BY id, shop
+    ) deduped
+    WHERE del = 0 AND vis = 1
+    GROUP BY shop
+    LIMIT 5000
+    FORMAT JSON
+  `;
+
+  const result = await tinybirdQuery<Array<RawOrderRow>>({ q: sql });
+
+  const counts = new Map<string, number>();
+  for (const row of result.data) {
+    counts.set(row.shop, Number(row.orders) || 0);
+  }
+  return counts;
+};
+
+export type IcpSummary = {
   baselineCount: number;
-  dimensions: Array<ScorecardDimension>;
+  idealCount: number;
+  notIdealCount: number;
+  idealRate: number;
+  medianIdealMrr: number;
+  medianIdealTenureMonths: number;
+  dimensions: Array<IcpDimension>;
 };
 
-export const computeICPScorecard = (
-  shops: Array<ShopWithRevenue>,
-): ICPScorecard => {
-  const champions = shops.filter(isChampion);
-  const churners = shops.filter(isEarlyChurner);
-  const baseline = shops.filter((s) => s.isInstalled);
+export const getIcp = cache(async (): Promise<IcpSummary> => {
+  const shopsPromise = supabase
+    .from("shops")
+    .select(`
+      shop,
+      vertical,
+      isInstalled,
+      order_count_at_install,
+      app_install_utm_source,
+      app_install_fbclid,
+      app_install_gclid,
+      app_install_surface_type,
+      plan_public_display_name,
+      shopify_plus,
+      is_partner_development_plan,
+      shopData,
+      currently_active_subscription_id
+    `)
+    .limit(3000);
 
-  const dimensions: Array<ScorecardDimension> = [
+  const platformsPromise = supabase
+    .from("connected_platforms")
+    .select(`
+      shop,
+      status,
+      connectable_platforms (
+        key
+      )
+    `)
+    .limit(20000);
+
+  const [
+    { data: shops, error: shopsError },
+    { data: platforms, error: platformsError },
+    subscriptions,
+    sessionCounts,
+    monthlyAverages,
+    orders90d,
+  ] = await Promise.all([
+    shopsPromise,
+    platformsPromise,
+    fetchAllSubscriptions(),
+    getShopSessionCounts(),
+    fetchMonthlyAverages(),
+    fetchOrders90d(),
+  ]);
+
+  if (shopsError) {
+    console.error("Error fetching shops", shopsError);
+    throw shopsError;
+  }
+  if (platformsError) {
+    console.error("Error fetching connected platforms", platformsError);
+    throw platformsError;
+  }
+
+  const subsByShop = new Map<string, Array<RawSubscription>>();
+  for (const sub of subscriptions) {
+    const list = subsByShop.get(sub.shop) ?? [];
+    list.push(sub);
+    subsByShop.set(sub.shop, list);
+  }
+
+  const platformCountByShop = new Map<string, number>();
+  for (const platform of platforms) {
+    if (platform.status !== "OK") {
+      continue;
+    }
+    platformCountByShop.set(
+      platform.shop,
+      (platformCountByShop.get(platform.shop) ?? 0) + 1,
+    );
+  }
+
+  const now = new Date();
+  const baselineCutoffMs =
+    now.getTime() - BASELINE_MIN_MONTHS * DAYS_PER_MONTH * 86400000;
+
+  const ideal: Array<IcpShop> = [];
+  const notIdeal: Array<IcpShop> = [];
+
+  for (const row of shops) {
+    const subs = subsByShop.get(row.shop) ?? [];
+
+    let firstPaidAt: string | null = null;
+    for (const sub of subs) {
+      if (sub.activated_at && (sub.price ?? 0) > 0) {
+        if (!firstPaidAt || sub.activated_at < firstPaidAt) {
+          firstPaidAt = sub.activated_at;
+        }
+      }
+    }
+
+    // Baseline: shops whose first paid subscription is old enough to judge.
+    // Anything younger hasn't had time to qualify as ideal, so it is excluded
+    // rather than polluting the not-ideal cohort.
+    if (!firstPaidAt || new Date(firstPaidAt).getTime() > baselineCutoffMs) {
+      continue;
+    }
+
+    const activeSub = row.currently_active_subscription_id
+      ? subs.find((s) => s.id === row.currently_active_subscription_id)
+      : null;
+    const isPaying = (activeSub?.price ?? 0) > 0;
+
+    const shopData = parseShopData(row.shopData);
+
+    // Most recent paid plan — the current plan for active shops, the final
+    // plan for churned ones.
+    let lastPaidSub: RawSubscription | null = null;
+    for (const sub of subs) {
+      if (sub.activated_at && (sub.price ?? 0) > 0) {
+        if (!lastPaidSub || sub.activated_at > (lastPaidSub.activated_at ?? "")) {
+          lastPaidSub = sub;
+        }
+      }
+    }
+
+    const averages = monthlyAverages.get(row.shop) ?? null;
+
+    const icpShop: IcpShop = {
+      shop: row.shop,
+      isInstalled: row.isInstalled === true,
+      mrr: activeSub?.price ?? 0,
+      tenureMonths: monthsBetween(new Date(firstPaidAt), now),
+      orderCountAtInstall: row.order_count_at_install,
+      vertical: row.vertical,
+      shopifyPlanName:
+        row.plan_public_display_name ?? shopData?.plan?.displayName ?? null,
+      shopifyPlus: row.shopify_plus ?? shopData?.plan?.shopifyPlus === true,
+      isPartnerDev:
+        row.is_partner_development_plan ??
+        shopData?.plan?.partnerDevelopment === true,
+      referralChannel: referralChannel(row),
+      originPlanKey: lastPaidSub?.plan_key ?? null,
+      setupCompleted: subs.some((s) => s.has_completed_setup),
+      adPlatformCount: platformCountByShop.get(row.shop) ?? 0,
+      monthlyRevenue: averages ? averages.monthlyRevenue : null,
+      monthlyAdSpend: averages ? averages.monthlyAdSpend : null,
+      ordersPerMonth: (orders90d.get(row.shop) ?? 0) / 3,
+    };
+
+    const isIdeal =
+      row.isInstalled === true &&
+      isPaying &&
+      (sessionCounts.get(row.shop) ?? 0) >= IDEAL_MIN_SESSIONS;
+
+    if (isIdeal) {
+      ideal.push(icpShop);
+    } else {
+      notIdeal.push(icpShop);
+    }
+  }
+
+  // Revenue, ad spend and order volume are deleted when a shop uninstalls, so
+  // those dimensions only compare still-installed shops (every ideal shop is
+  // installed by definition).
+  const notIdealInstalled = notIdeal.filter((s) => s.isInstalled);
+
+  const dimensions: Array<IcpDimension> = [
     buildDimension({
-      key: "shopify_plus",
-      label: "Shopify Plus",
-      group: "Firmographics",
-      bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(s.shopifyPlus),
-      classifyChurner: (s) => yesNo(s.shopifyPlus),
-      classifyBaseline: (s) => yesNo(s.shopifyPlus),
+      key: "monthly_revenue",
+      label: "Monthly revenue",
+      note: "Avg tracked revenue per month (USD) · still-installed shops only — data is deleted on uninstall",
+      bucketOrder: ["$0", "<$1k", "$1k–$10k", "$10k–$50k", "$50k–$200k", "$200k+", "unknown"],
+      sortByDelta: false,
+      ideal,
+      notIdeal: notIdealInstalled,
+      classify: (s) => monthlyRevenueBucket(s.monthlyRevenue),
     }),
     buildDimension({
-      key: "partner_dev",
-      label: "Partner dev store",
-      group: "Firmographics",
-      bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(s.isPartnerDev),
-      classifyChurner: (s) => yesNo(s.isPartnerDev),
-      classifyBaseline: (s) => yesNo(s.isPartnerDev),
+      key: "monthly_ad_spend",
+      label: "Monthly ad spend",
+      note: "Avg ad spend per month (USD) · still-installed shops only — data is deleted on uninstall",
+      bucketOrder: ["$0", "<$500", "$500–$2.5k", "$2.5k–$10k", "$10k+", "unknown"],
+      sortByDelta: false,
+      ideal,
+      notIdeal: notIdealInstalled,
+      classify: (s) => monthlyAdSpendBucket(s.monthlyAdSpend),
+    }),
+    buildDimension({
+      key: "orders_per_month",
+      label: "Orders / month",
+      note: "Tracked orders in the last 90 days ÷ 3 · still-installed shops only — data is deleted on uninstall",
+      bucketOrder: ["0", "1–49", "50–199", "200–999", "1k+"],
+      sortByDelta: false,
+      ideal,
+      notIdeal: notIdealInstalled,
+      classify: (s) => ordersPerMonthBucket(s.ordersPerMonth),
+    }),
+    buildDimension({
+      key: "origin_plan",
+      label: "Origin plan",
+      note: "Most recent paid plan — current for active shops, final for churned",
+      bucketOrder: [],
+      ideal,
+      notIdeal,
+      classify: (s) =>
+        s.originPlanKey ? titleCase(s.originPlanKey) : "unknown",
+    }),
+    buildDimension({
+      key: "orders_at_install",
+      label: "Merchant size",
+      note: "Orders at install — survives uninstall, so comparable across both cohorts (live GMV is deleted for churned shops)",
+      bucketOrder: ["0", "1–99", "100–999", "1k–10k", "10k+", "unknown"],
+      sortByDelta: false,
+      ideal,
+      notIdeal,
+      classify: (s) => orderCountBucket(s.orderCountAtInstall),
+    }),
+    buildDimension({
+      key: "vertical",
+      label: "Vertical",
+      note: "Shopify-reported store vertical",
+      bucketOrder: [],
+      ideal,
+      notIdeal,
+      classify: (s) => (s.vertical ? titleCase(s.vertical) : "unknown"),
     }),
     buildDimension({
       key: "shopify_plan",
       label: "Shopify plan",
-      group: "Firmographics",
+      note: "Plus / Partner dev flags take precedence over the public plan name",
       bucketOrder: [],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => s.shopifyPlanName ?? "unknown",
-      classifyChurner: (s) => s.shopifyPlanName ?? "unknown",
-      classifyBaseline: (s) => s.shopifyPlanName ?? "unknown",
+      ideal,
+      notIdeal,
+      classify: shopifyPlanLabel,
     }),
     buildDimension({
-      key: "currency",
-      label: "Currency",
-      group: "Firmographics",
+      key: "referral_channel",
+      label: "Referral channel",
+      note: "utm_source › paid-click marker › app-store surface › organic",
       bucketOrder: [],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => s.currency,
-      classifyChurner: (s) => s.currency,
-      classifyBaseline: (s) => s.currency,
+      ideal,
+      notIdeal,
+      classify: (s) => s.referralChannel,
     }),
     buildDimension({
-      key: "order_count_at_install",
-      label: "Orders at install",
-      group: "Maturity",
-      bucketOrder: ["0", "1–99", "100–999", "1k–10k", "10k–100k", "100k+", "unknown"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => orderCountBucket(s.orderCountAtInstall),
-      classifyChurner: (s) => orderCountBucket(s.orderCountAtInstall),
-      classifyBaseline: (s) => orderCountBucket(s.orderCountAtInstall),
+      key: "ad_platforms",
+      label: "Ad platforms connected",
+      note: "Platforms with a healthy (OK) connection today",
+      bucketOrder: ["0", "1", "2+"],
+      ideal,
+      notIdeal,
+      classify: (s) => adPlatformBucket(s.adPlatformCount),
     }),
     buildDimension({
-      key: "pixel_installed",
-      label: "Origin pixel installed",
-      group: "Activation",
-      bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(s.originPixelAddedAt !== null),
-      classifyChurner: (s) => yesNo(s.originPixelAddedAt !== null),
-      classifyBaseline: (s) => yesNo(s.originPixelAddedAt !== null),
-    }),
-    buildDimension({
-      key: "time_to_pixel",
-      label: "Time to pixel",
-      group: "Activation",
-      bucketOrder: [
-        "<1h",
-        "1–24h",
-        "1–7d",
-        "7–30d",
-        "30d+",
-        "never",
-        "before install",
-        "unknown",
-      ],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => timeToPixelBucket(s),
-      classifyChurner: (s) => timeToPixelBucket(s),
-      classifyBaseline: (s) => timeToPixelBucket(s),
-    }),
-    buildDimension({
-      key: "setup_complete",
+      key: "setup_completed",
       label: "Completed setup",
-      group: "Activation",
+      note: "Whether any subscription ever completed setup",
       bucketOrder: ["yes", "no"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => yesNo(s.hasCompletedSetup),
-      classifyChurner: (s) => yesNo(s.hasCompletedSetup),
-      classifyBaseline: (s) => yesNo(s.hasCompletedSetup),
-    }),
-    buildDimension({
-      key: "install_source",
-      label: "Install attribution",
-      group: "Acquisition",
-      bucketOrder: ["Meta ad click", "Google ad click", "organic / direct"],
-      champions,
-      churners,
-      baseline,
-      classifyChampion: (s) => installSource(s),
-      classifyChurner: (s) => installSource(s),
-      classifyBaseline: (s) => installSource(s),
+      ideal,
+      notIdeal,
+      classify: (s) => (s.setupCompleted ? "yes" : "no"),
     }),
   ];
 
+  // Strongest-correlating dimension first, so the page reads top-to-bottom by
+  // signal strength.
+  const signal = (dimension: IcpDimension) => {
+    return Math.max(...dimension.buckets.map((b) => Math.abs(b.delta)), 0);
+  };
+  dimensions.sort((a, b) => signal(b) - signal(a));
+
+  const baselineCount = ideal.length + notIdeal.length;
+
   return {
-    championCount: champions.length,
-    earlyChurnerCount: churners.length,
-    baselineCount: baseline.length,
+    baselineCount,
+    idealCount: ideal.length,
+    notIdealCount: notIdeal.length,
+    idealRate: baselineCount > 0 ? ideal.length / baselineCount : 0,
+    medianIdealMrr: median(ideal.map((s) => s.mrr)),
+    medianIdealTenureMonths: median(ideal.map((s) => s.tenureMonths)),
     dimensions,
   };
-};
-
-export type ActivationFunnelStep = {
-  label: string;
-  count: number;
-  conversionFromTop: number;
-  conversionFromPrev: number;
-};
-
-export const computeActivationFunnel = (
-  shops: Array<ShopWithRevenue>,
-): Array<ActivationFunnelStep> => {
-  const installed = shops.length;
-  const pixelLive = shops.filter((s) => s.originPixelAddedAt !== null).length;
-  const adConnected = shops.filter((s) => hasAnyAd(s)).length;
-  const firstOrder = shops.filter((s) => s.revenue90d > 0).length;
-  const onboarded = shops.filter((s) => s.hasCompletedSetup).length;
-  const paying = shops.filter((s) => s.isPaying).length;
-
-  const raw = [
-    { label: "Installed", count: installed },
-    { label: "Pixel live", count: pixelLive },
-    { label: "Ad platform connected", count: adConnected },
-    { label: "First order tracked (90d)", count: firstOrder },
-    { label: "Completed setup", count: onboarded },
-    { label: "Paying", count: paying },
-  ];
-
-  return raw.map((step, index) => {
-    const prev = index === 0 ? installed : raw[index - 1].count;
-    return {
-      label: step.label,
-      count: step.count,
-      conversionFromTop: installed > 0 ? step.count / installed : 0,
-      conversionFromPrev: prev > 0 ? step.count / prev : 0,
-    };
-  });
-};
-
-export type ChurnDistributionPoint = {
-  bucket: string;
-  [series: string]: number | string;
-};
-
-export type ChurnDistributionSeries = {
-  key: string;
-  label: string;
-  total: number;
-};
-
-export type ChurnSplitBy =
-  | "none"
-  | "install-source"
-  | "shopify-plus";
-
-const CHURN_BUCKETS: Array<{ label: string; min: number; max: number | null }> = [
-  { label: "<1d", min: 0, max: 1 },
-  { label: "1–7d", min: 1, max: 7 },
-  { label: "7–14d", min: 7, max: 14 },
-  { label: "14–30d", min: 14, max: 30 },
-  { label: "30–60d", min: 30, max: 60 },
-  { label: "60–90d", min: 60, max: 90 },
-  { label: "90–180d", min: 90, max: 180 },
-  { label: "180d+", min: 180, max: null },
-];
-
-const ORDER_FOR_SPLIT: Record<ChurnSplitBy, Array<string>> = {
-  "none": ["all"],
-  "install-source": ["Meta ad click", "Google ad click", "organic / direct"],
-  "shopify-plus": ["yes", "no"],
-};
-
-const seriesKeyFor = (params: {
-  shop: ShopWithRevenue;
-  splitBy: ChurnSplitBy;
-}): string => {
-  const { shop, splitBy } = params;
-  if (splitBy === "none") {
-    return "all";
-  }
-  if (splitBy === "install-source") {
-    return installSource(shop);
-  }
-  return yesNo(shop.shopifyPlus);
-};
-
-export type ChurnDistributionResult = {
-  data: Array<ChurnDistributionPoint>;
-  series: Array<ChurnDistributionSeries>;
-};
-
-export const computeChurnDistribution = (params: {
-  shops: Array<ShopWithRevenue>;
-  splitBy?: ChurnSplitBy;
-}): ChurnDistributionResult => {
-  const splitBy = params.splitBy ?? "none";
-  const seriesOrder = ORDER_FOR_SPLIT[splitBy];
-
-  const buckets = new Map<string, ChurnDistributionPoint>();
-  for (const bucket of CHURN_BUCKETS) {
-    const point: ChurnDistributionPoint = { bucket: bucket.label };
-    for (const key of seriesOrder) {
-      point[key] = 0;
-    }
-    buckets.set(bucket.label, point);
-  }
-
-  const totals = new Map<string, number>();
-  const observedKeys = new Set<string>();
-
-  for (const shop of params.shops) {
-    const days = installToUninstallDays(shop);
-    if (days === null || days < 0) {
-      continue;
-    }
-    const bucket = CHURN_BUCKETS.find((b) => {
-      return days >= b.min && (b.max === null || days < b.max);
-    });
-    if (!bucket) {
-      continue;
-    }
-    const point = buckets.get(bucket.label);
-    if (!point) {
-      continue;
-    }
-
-    const seriesKey = seriesKeyFor({ shop, splitBy });
-    observedKeys.add(seriesKey);
-    point[seriesKey] = ((point[seriesKey] as number | undefined) ?? 0) + 1;
-    totals.set(seriesKey, (totals.get(seriesKey) ?? 0) + 1);
-  }
-
-  const orderedKeys = Array.from(
-    new Set([...seriesOrder, ...Array.from(observedKeys)]),
-  );
-
-  for (const point of buckets.values()) {
-    for (const key of orderedKeys) {
-      if (point[key] === undefined) {
-        point[key] = 0;
-      }
-    }
-  }
-
-  const series: Array<ChurnDistributionSeries> = orderedKeys.map((key) => {
-    return {
-      key,
-      label: key,
-      total: totals.get(key) ?? 0,
-    };
-  });
-
-  return {
-    data: Array.from(buckets.values()),
-    series,
-  };
-};
-
-export type ChurnTypeBreakdown = {
-  neverActivated: number;
-  gotValue: number;
-  total: number;
-};
-
-export const computeChurnTypeBreakdown = (
-  shops: Array<ShopWithRevenue>,
-): ChurnTypeBreakdown => {
-  const churned = shops.filter((s) => {
-    return !s.isInstalled && s.uninstalledAt !== null;
-  });
-
-  let neverActivated = 0;
-  let gotValue = 0;
-  for (const shop of churned) {
-    if (shop.originPixelAddedAt === null && shop.revenue90d === 0) {
-      neverActivated += 1;
-    } else {
-      gotValue += 1;
-    }
-  }
-
-  return {
-    neverActivated,
-    gotValue,
-    total: churned.length,
-  };
-};
-
-export type AcquisitionRow = {
-  source: string;
-  installs: number;
-  paying: number;
-  champions: number;
-  payingRate: number;
-  championRate: number;
-};
-
-export const computeAcquisitionBreakdown = (
-  shops: Array<ShopProfile>,
-  withRevenue: Array<ShopWithRevenue>,
-): Array<AcquisitionRow> => {
-  const championIds = new Set(
-    withRevenue.filter(isChampion).map((s) => s.shop),
-  );
-  const counts = new Map<
-    string,
-    { installs: number; paying: number; champions: number }
-  >();
-
-  for (const shop of shops) {
-    const source = installSource(shop);
-    const entry = counts.get(source) ?? {
-      installs: 0,
-      paying: 0,
-      champions: 0,
-    };
-    entry.installs += 1;
-    if (shop.isPaying) {
-      entry.paying += 1;
-    }
-    if (championIds.has(shop.shop)) {
-      entry.champions += 1;
-    }
-    counts.set(source, entry);
-  }
-
-  return Array.from(counts.entries())
-    .map(([source, entry]) => {
-      return {
-        source,
-        installs: entry.installs,
-        paying: entry.paying,
-        champions: entry.champions,
-        payingRate: entry.installs > 0 ? entry.paying / entry.installs : 0,
-        championRate: entry.installs > 0 ? entry.champions / entry.installs : 0,
-      };
-    })
-    .sort((a, b) => b.installs - a.installs);
-};
+});

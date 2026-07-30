@@ -82,36 +82,20 @@ The dashboard fans out to three systems. Each lives behind its own client in `li
 
 Caching: every cross-system fetcher in `lib/data/` is wrapped in React's `cache()` so a single page render makes one round trip per data source even when multiple components consume it.
 
-## Activity & engagement model
+## Pages
 
-Activity-based signals come from PostHog `$pageview` events and live in `lib/data/activity.ts`. There are two fetchers:
+The dashboard was rebuilt from scratch in Jul 2026; new report pages are being added one at a time.
 
-- `getShopActivity()` — pulls the last 30 days. Returns `{ shop, pageviews14d, reportPageviews14d, pageviews30d, lastSeenAt }`. Two windows in one query: 14d (active / super-active) + 30d (legacy engagement tier). `ACTIVE_PAGEVIEW_WINDOW_DAYS = 14`. A "report pageview" is any `$pageview` whose `$pathname` does NOT start with `/settings` or `/utm-notepad` — those paths are admin/UI surfaces, not value-bearing report views.
-- `getShopMonthlyActivity()` — last 18 months, bucketed by calendar month. Returns `{ shop, activeMonths, superActiveMonths }`. A month is in `superActiveMonths` if the shop had ≥`SUPER_ACTIVE_PAGEVIEW_THRESHOLD` (= 3) report pageviews in that month. Window length is `MONTHLY_ACTIVITY_WINDOW_MONTHS` and matches `COHORT_MONTHS` in `cohorts.ts` so the retention chart has full coverage.
-
-`ShopWithRevenue` (in `lib/data/insights.ts`) carries `pageviews14d`, `reportPageviews14d`, `pageviews30d`, `lastSeenAt`, and `firstPaidAt` (the earliest `activated_at` of any subscription with `price > 0`). Both join helpers (`joinShopsWithRevenue`, `joinAllShopsWithRevenue`) accept an optional `activity` array and default the fields to 0/null when omitted.
-
-### Metric definitions
-
-These definitions live in code, but documenting them here prevents silent drift when reading the UI:
-
-- **Active** (`lib/data/activity.ts:isActive`) — `pageviews14d > 0` AND `lastSeenAt >= firstPaidAt`. The post-`firstPaidAt` check is the whole point: the metric measures shops that have meaningfully used the app *after* paying. Surfaced as the "Active shops (14d)" KPI on `/insights` and as one of the cohort retention charts.
-- **Super-active** (`lib/data/activity.ts:isSuperActive`) — `reportPageviews14d >= 3` AND `lastSeenAt >= firstPaidAt`. Same post-subscribe gate, but tightens the bar to ≥3 *report* pageviews (excludes `/settings` and `/utm-notepad`) — a shop only counts if it's actually been checking metrics, which is how you get value from Origin. Surfaced as the "Super-active (14d)" KPI on `/insights`, as the second cohort retention chart, and as the activity check inside the Champion definition.
-- **Engagement tier** (`lib/data/health.ts`) — `high` if `pageviews30d > 0`, else `low`. Drives the customer-health matrix on `/lifecycle` (Champions / Upsell candidates / At-risk / Churn candidates). Pre-Apr 2026 this was a 3-signal score (revenue + pixel + ad platform); it was replaced because pixel/ad-platform are install-time signals, not usage signals. Health matrix intentionally still uses the looser 30d window — the goal there is to flag *currently* disengaged paying shops, not to filter for post-subscribe value-getting.
-- **Champion** (`lib/data/icp.ts:isChampion`) — installed AND paying AND tenure ≥ 90d AND `revenue90d > 0` AND `isSuperActive(shop)`. The super-active check is what stops a shop that paid once a year ago and never came back from being labelled a champion, and ensures Champions are people actually opening report pages — i.e. getting value.
-- **Plan tier** (`lib/data/health.ts`) — `paid` if `isPaying && plan ∈ {standard, pro, platinum}`, else `free`.
-- **Cohort retention** (`lib/data/cohorts.ts`) — cohort = install month. The page renders two charts: an "active" chart where a shop is "retained in month N" iff it fired ≥1 `$pageview` in calendar month (install + N), and a "super-active" chart that requires ≥3 report pageviews in that month. Crucially this is *not* "still installed" — shops that stay installed but stop visiting drop off the curve. Cohort size comes from installs, so percentages are comparable across rows.
+- `/shops` — every shop in a filterable/sortable table: install state, 30d sessions, last active, 30d revenue (USD), 30d ad spend (USD), Shopify plan. Data comes from `lib/data/shops.ts` (`getShopList`).
+- `/shops/[shop]` — shop detail: install date, current Origin plan + MRR, estimated LTV (months active × monthly price summed across paid subscriptions), basic info, feature flag toggles, and a 12-month revenue vs ad spend chart. Data comes from `lib/data/shop-profile.ts`; flag toggles go through the server action in `app/shops/[shop]/actions.ts` (writes `feature_flag_records` via `supabaseAdmin`, which needs `SUPABASE_SERVICE_ROLE_KEY`).
 
 ### Where to look for what
 
 | Concern | File |
 |---------|------|
-| Active / super-active / pageview signal + helpers | `lib/data/activity.ts` |
-| Shop profile + revenue join + `firstPaidAt` | `lib/data/insights.ts` |
-| Champion / ICP scorecard / churn classification | `lib/data/icp.ts` |
-| Health matrix (plan tier × engagement tier) | `lib/data/health.ts` |
-| Cohort retention (active + super-active variants) | `lib/data/cohorts.ts` |
-| MRR movement | `lib/data/mrr.ts` |
+| Session activity (30d sessions + last seen, from `shop_user_sessions`) | `lib/data/activity.ts` |
+| Shops list (profiles + 30d revenue + 30d ad spend) | `lib/data/shops.ts` |
+| Shop detail (plan, LTV, feature flags, monthly financials) | `lib/data/shop-profile.ts` |
 
 ## Writing code
 

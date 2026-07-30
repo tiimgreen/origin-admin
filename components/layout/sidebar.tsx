@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, Award, BarChart3, Compass, LayoutDashboard, LineChart, Magnet, Repeat, Store } from "lucide-react";
+import { Activity, BarChart3, Store, Target } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -13,23 +13,14 @@ type NavItem = {
 };
 
 const NAV_ITEMS: Array<NavItem> = [
-  { label: "Overview", href: "/", icon: LayoutDashboard },
   { label: "Shops", href: "/shops", icon: Store },
-  { label: "Insights", href: "/insights", icon: Compass },
-  { label: "Retained ICP", href: "/icp", icon: Award },
-  { label: "Cohorts", href: "/cohorts", icon: LineChart },
-  { label: "Stickiness", href: "/stickiness", icon: Magnet },
-  { label: "App Store", href: "/stickiness/shopify", icon: Store },
-  { label: "Lifecycle", href: "/lifecycle", icon: Repeat },
+  { label: "ICP", href: "/icp", icon: Target },
 ];
 
 export const Sidebar = () => {
   const pathname = usePathname();
 
   const activeHref = NAV_ITEMS.filter((item) => {
-    if (item.href === "/") {
-      return pathname === "/";
-    }
     return pathname === item.href || pathname.startsWith(`${item.href}/`);
   })
     .sort((a, b) => b.href.length - a.href.length)
