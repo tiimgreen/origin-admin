@@ -61,3 +61,81 @@ export const setFeatureFlag = async ({
 
   return { success: true };
 };
+
+const GET_APP_NAME = `#graphql
+  query GetAppName($id: ID!) {
+    app(id: $id) {
+      id
+      title
+    }
+  }
+`;
+
+const SHOPIFY_API_VERSION = "2025-10";
+
+type LookupAppNameArgs = {
+  shop: string;
+  appId: string;
+};
+
+export const lookupAppName = async ({
+  shop,
+  appId,
+}: LookupAppNameArgs): Promise<{
+  success: boolean;
+  title?: string | null;
+  error?: string;
+}> => {
+  const { data: sessions, error: sessionsError } = await supabaseAdmin
+    .from("shopify_sessions")
+    .select("accessToken")
+    .eq("shop", shop)
+    .eq("isOnline", false)
+    .not("accessToken", "is", null);
+
+  if (sessionsError) {
+    console.error("Error fetching shopify session", sessionsError);
+    return { success: false, error: "Error fetching shopify session" };
+  }
+
+  const accessToken = sessions[0]?.accessToken;
+
+  if (!accessToken) {
+    return { success: false, error: "No offline access token for this shop" };
+  }
+
+  try {
+    const response = await fetch(
+      `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": accessToken,
+        },
+        body: JSON.stringify({
+          query: GET_APP_NAME,
+          variables: {
+            id: `gid://shopify/App/${appId}`,
+          },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      console.error("Shopify GraphQL request failed", response.status);
+      return {
+        success: false,
+        error: `Shopify request failed (${response.status})`,
+      };
+    }
+
+    const body: { data?: { app?: { title?: string | null } | null } } =
+      await response.json();
+
+    return { success: true, title: body.data?.app?.title ?? null };
+  } catch (error) {
+    console.error("Error fetching app name", error);
+    return { success: false, error: "Error fetching app name" };
+  }
+};

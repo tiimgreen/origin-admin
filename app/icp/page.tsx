@@ -135,7 +135,7 @@ const IcpSkeleton = () => {
 
 export default function IcpPage() {
   return (
-    <div className="space-y-6">
+    <div className="mx-auto max-w-7xl space-y-6">
       <PageHeader
         title="ICP"
         description="What ideal customers have in common that the rest of the baseline doesn't."

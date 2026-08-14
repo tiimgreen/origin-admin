@@ -33,8 +33,8 @@ export default function RootLayout({ children }: RootLayoutProps) {
       <body className="min-h-full">
         <div className="flex min-h-screen">
           <Sidebar />
-          <main className="flex flex-1 flex-col">
-            <div className="mx-auto w-full max-w-7xl flex-1 px-6 py-8 lg:px-8">
+          <main className="flex min-w-0 flex-1 flex-col">
+            <div className="w-full flex-1 px-6 py-8 lg:px-8">
               {children}
             </div>
           </main>

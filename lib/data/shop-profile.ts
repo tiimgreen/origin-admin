@@ -58,7 +58,7 @@ type RawSubscription = {
   current_period_end: string | null;
 };
 
-const estimateLtv = (subscriptions: Array<RawSubscription>): number => {
+export const estimateLtv = (subscriptions: Array<RawSubscription>): number => {
   let total = 0;
 
   for (const sub of subscriptions) {
@@ -211,7 +211,7 @@ export const getShopFeatureFlags = cache(
 
     const byName = new Map(records.map((r) => [r.name, r.active]));
 
-    const names = [...KNOWN_FEATURE_FLAGS];
+    const names: Array<string> = [];
     for (const record of records) {
       if (!names.includes(record.name)) {
         names.push(record.name);

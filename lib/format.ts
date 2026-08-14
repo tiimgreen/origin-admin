@@ -49,6 +49,17 @@ export const formatPercent = (value: number, decimals = 1) => {
   return formatter.format(value);
 };
 
+type ShopUserNameArgs = {
+  firstName: string | null;
+  lastName: string | null;
+  email: string;
+};
+
+export const shopUserDisplayName = (user: ShopUserNameArgs) => {
+  const name = [user.firstName, user.lastName].filter(Boolean).join(" ");
+  return name.length > 0 ? name : user.email;
+};
+
 type FormatDeltaArgs = {
   current: number;
   previous: number;

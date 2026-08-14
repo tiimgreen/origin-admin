@@ -25,13 +25,6 @@ export const supabaseAdmin = createClient<Database>(
 
 export const JSON_NO_ROWS_ERROR_CODE = "PGRST116";
 
-export type FeatureFlags = {
-  csv_export?: boolean;
-  facebook_link?: boolean;
-  advanced_event_tracking?: boolean;
-  multi_touch_attribution_models?: boolean;
-};
-
 export type ShopSettings = {
   conversions_api_active?: boolean;
   google_enhanced_conversions_active?: boolean;

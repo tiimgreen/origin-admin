@@ -1,13 +1,16 @@
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ExternalLink } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { CopyButton } from "@/components/ui/copy-button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader } from "@/components/layout/page-header";
+import { AppNameLookupCard } from "@/components/shops/app-name-lookup-card";
 import { FeatureFlagsCard } from "@/components/shops/feature-flags-card";
+import { ShopUsersCard } from "@/components/shops/shop-users-card";
 import { RevenueSpendChart } from "@/components/charts/revenue-spend-chart";
 import {
   getShopDetail,
@@ -15,9 +18,33 @@ import {
   getShopMonthlyFinancials,
   type ShopDetail,
 } from "@/lib/data/shop-profile";
+import { getShopUsers } from "@/lib/data/shop-users";
 import { formatCurrency } from "@/lib/format";
+import { cn } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
+
+type StorefrontLinkProps = {
+  shop: string;
+  className?: string;
+};
+
+const StorefrontLink = ({ shop, className }: StorefrontLinkProps) => {
+  return (
+    <a
+      href={`https://${shop}`}
+      target="_blank"
+      rel="noreferrer"
+      className={cn(
+        "inline-flex items-center gap-1 font-mono hover:text-foreground hover:underline",
+        className,
+      )}
+    >
+      {shop}
+      <ExternalLink className="h-3 w-3" />
+    </a>
+  );
+};
 
 const formatDate = (iso: string | null) => {
   if (!iso) {
@@ -75,7 +102,10 @@ const BasicInfoCard = ({ detail }: { detail: ShopDetail }) => {
       <CardContent className="pt-0">
         <div className="divide-y">
           <InfoRow label="Domain">
-            <span className="font-mono">{detail.shop}</span>
+            <span className="inline-flex items-center gap-1.5">
+              <StorefrontLink shop={detail.shop} />
+              <CopyButton value={detail.shop} />
+            </span>
           </InfoRow>
           <InfoRow label="Install state">
             <Badge variant={detail.isInstalled ? "success" : "secondary"}>
@@ -128,6 +158,26 @@ const FinancialsCard = async ({ detail }: { detail: ShopDetail }) => {
   );
 };
 
+const UsersCard = async ({ detail }: { detail: ShopDetail }) => {
+  const users = await getShopUsers({ shop: detail.shop });
+
+  return <ShopUsersCard shop={detail.shop} users={users} />;
+};
+
+const UsersCardSkeleton = () => {
+  return (
+    <Card>
+      <CardHeader className="space-y-2">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-3 w-48" />
+      </CardHeader>
+      <CardContent>
+        <Skeleton className="h-32 w-full" />
+      </CardContent>
+    </Card>
+  );
+};
+
 const FinancialsCardSkeleton = () => {
   return (
     <Card>
@@ -161,7 +211,7 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
     : [];
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto max-w-7xl space-y-6">
       <Link
         href="/shops"
         className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
@@ -172,7 +222,14 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
 
       <PageHeader
         title={detail.name ?? detail.shop}
-        description={detail.name ? detail.shop : undefined}
+        description={
+          detail.name ? (
+            <span className="inline-flex items-center gap-1.5">
+              <StorefrontLink shop={detail.shop} />
+              <CopyButton value={detail.shop} />
+            </span>
+          ) : undefined
+        }
         actions={
           <Badge variant={detail.isInstalled ? "success" : "secondary"}>
             {detail.isInstalled ? "Installed" : "Uninstalled"}
@@ -209,7 +266,12 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
           subscriptionId={detail.currentPlan?.subscriptionId ?? null}
           flags={flags}
         />
+        <AppNameLookupCard shop={detail.shop} />
       </div>
+
+      <Suspense fallback={<UsersCardSkeleton />}>
+        <UsersCard detail={detail} />
+      </Suspense>
 
       <Suspense fallback={<FinancialsCardSkeleton />}>
         <FinancialsCard detail={detail} />

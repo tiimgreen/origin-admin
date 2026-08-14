@@ -12,7 +12,7 @@ const ShopsBoard = async () => {
   const shops = await getShopList();
 
   return (
-    <Card>
+    <Card className="overflow-hidden">
       <CardHeader>
         <CardTitle className="text-base font-semibold text-foreground">
           All shops
@@ -22,7 +22,7 @@ const ShopsBoard = async () => {
           a shop&apos;s details
         </p>
       </CardHeader>
-      <CardContent className="pt-0">
+      <CardContent className="p-0">
         <ShopsTable shops={shops} />
       </CardContent>
     </Card>
