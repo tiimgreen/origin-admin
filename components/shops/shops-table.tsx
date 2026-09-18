@@ -243,7 +243,7 @@ const columns = helper.columns([
         <div className="flex flex-col leading-tight">
           <span className="font-medium">{titleCase(shop.originPlanKey)}</span>
           <span className="text-[10px] tabular-nums text-muted-foreground">
-            {formatCurrency({ amount: shop.originPlanPrice })}/mo
+            {formatCurrency({ amount: shop.originPlanPrice, decimals: 0 })}/mo
           </span>
         </div>
       );

@@ -2,8 +2,16 @@ import { cache } from "react";
 
 import { supabase } from "@/lib/supabase";
 
+import { isoDate, startOfDayUtc, subtractDays } from "./dates";
+
 const PAGE_SIZE = 1000;
 const DAY_MS = 86_400_000;
+const DAILY_WINDOW_DAYS = 30;
+
+export type DailySessionsPoint = {
+  day: string;
+  sessions: number;
+};
 
 export type ShopUserListRow = {
   id: number;
@@ -13,6 +21,8 @@ export type ShopUserListRow = {
   accountOwner: boolean;
   lastActiveAt: string | null;
   sessions30d: number;
+  // One point per calendar day (UTC) for the last 30 days, oldest first.
+  dailySessions30d: Array<DailySessionsPoint>;
 };
 
 export type ShopUserSession = {
@@ -107,18 +117,32 @@ export const getShopUsers = cache(
 
     const since30dMs = Date.now() - 30 * DAY_MS;
 
-    type Agg = { sessions30d: number; lastSeenMs: number };
+    const today = startOfDayUtc(new Date());
+    const dayKeys: Array<string> = [];
+    for (let i = DAILY_WINDOW_DAYS - 1; i >= 0; i--) {
+      dayKeys.push(isoDate(subtractDays(today, i)));
+    }
+
+    type Agg = {
+      sessions30d: number;
+      lastSeenMs: number;
+      sessionsByDay: Map<string, number>;
+    };
     const byUser = new Map<number, Agg>();
 
     for (const session of sessions) {
       const agg = byUser.get(session.shop_user_id) ?? {
         sessions30d: 0,
         lastSeenMs: 0,
+        sessionsByDay: new Map<string, number>(),
       };
 
       if (new Date(session.started_at).getTime() >= since30dMs) {
         agg.sessions30d += 1;
       }
+
+      const day = session.started_at.slice(0, 10);
+      agg.sessionsByDay.set(day, (agg.sessionsByDay.get(day) ?? 0) + 1);
 
       const lastSeenMs = new Date(session.last_seen_at).getTime();
       if (lastSeenMs > agg.lastSeenMs) {
@@ -142,6 +166,9 @@ export const getShopUsers = cache(
               ? new Date(agg.lastSeenMs).toISOString()
               : null,
           sessions30d: agg?.sessions30d ?? 0,
+          dailySessions30d: dayKeys.map((day) => {
+            return { day, sessions: agg?.sessionsByDay.get(day) ?? 0 };
+          }),
         };
       })
       .sort((a, b) => {
