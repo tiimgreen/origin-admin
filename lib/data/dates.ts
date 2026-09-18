@@ -30,3 +30,19 @@ export const formatMonthLabel = (key: string) => {
     timeZone: "UTC",
   });
 };
+
+export const formatDayLabel = (key: string) => {
+  const [year, month, day] = key.split("-").map((part) => Number(part));
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+};
+
+// A period key is either a month ("2026-09") or a day ("2026-09-15").
+export const formatPeriodLabel = (key: string) => {
+  return key.length === 7 ? formatMonthLabel(key) : formatDayLabel(key);
+};

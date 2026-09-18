@@ -10,8 +10,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader } from "@/components/layout/page-header";
 import { AppNameLookupCard } from "@/components/shops/app-name-lookup-card";
 import { FeatureFlagsCard } from "@/components/shops/feature-flags-card";
+import { ReviewCard } from "@/components/shops/review-card";
 import { ShopUsersCard } from "@/components/shops/shop-users-card";
 import { RevenueSpendChart } from "@/components/charts/revenue-spend-chart";
+import { getShopReview } from "@/lib/data/app-reviews";
 import {
   getShopDetail,
   getShopFeatureFlags,
@@ -19,7 +21,7 @@ import {
   type ShopDetail,
 } from "@/lib/data/shop-profile";
 import { getShopUsers } from "@/lib/data/shop-users";
-import { formatCurrency } from "@/lib/format";
+import { formatCurrency, formatDurationWords, titleCase } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -164,6 +166,26 @@ const UsersCard = async ({ detail }: { detail: ShopDetail }) => {
   return <ShopUsersCard shop={detail.shop} users={users} />;
 };
 
+const ShopReviewCard = async ({ detail }: { detail: ShopDetail }) => {
+  const review = await getShopReview({ shopName: detail.name });
+
+  return <ReviewCard review={review} />;
+};
+
+const ReviewCardSkeleton = () => {
+  return (
+    <Card>
+      <CardHeader className="space-y-2">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-3 w-48" />
+      </CardHeader>
+      <CardContent>
+        <Skeleton className="h-16 w-full" />
+      </CardContent>
+    </Card>
+  );
+};
+
 const UsersCardSkeleton = () => {
   return (
     <Card>
@@ -240,10 +262,10 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
       <div className="grid gap-4 sm:grid-cols-3">
         <StatCard
           label="Current plan"
-          value={detail.currentPlan?.planKey ?? "None"}
+          value={detail.currentPlan ? titleCase(detail.currentPlan.planKey) : "None"}
           hint={
             detail.currentPlan
-              ? `${formatCurrency({ amount: detail.currentPlan.price })}/mo MRR · since ${formatDate(detail.currentPlan.activatedAt)}`
+              ? `${formatCurrency({ amount: detail.currentPlan.price, decimals: 0 })}/mo MRR · since ${formatDate(detail.currentPlan.activatedAt)}`
               : "No active subscription"
           }
         />
@@ -254,8 +276,20 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
         />
         <StatCard
           label="Installed"
-          value={formatDate(detail.initialInstalledAt)}
-          hint={detail.uninstalledAt ? `Uninstalled ${formatDate(detail.uninstalledAt)}` : undefined}
+          value={
+            detail.initialInstalledAt
+              ? formatDurationWords({
+                  from: detail.initialInstalledAt,
+                  to: detail.uninstalledAt,
+                })
+              : "—"
+          }
+          hint={[
+            formatDate(detail.initialInstalledAt),
+            detail.uninstalledAt ? `Uninstalled ${formatDate(detail.uninstalledAt)}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         />
       </div>
 
@@ -266,6 +300,9 @@ export default async function ShopDetailPage({ params }: ShopDetailPageProps) {
           subscriptionId={detail.currentPlan?.subscriptionId ?? null}
           flags={flags}
         />
+        <Suspense fallback={<ReviewCardSkeleton />}>
+          <ShopReviewCard detail={detail} />
+        </Suspense>
         <AppNameLookupCard shop={detail.shop} />
       </div>
 

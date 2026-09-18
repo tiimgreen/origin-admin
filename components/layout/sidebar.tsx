@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, Store, Target } from "lucide-react";
+import { Activity, BarChart3, Store, Target, TrendingUp } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -15,6 +15,7 @@ type NavItem = {
 const NAV_ITEMS: Array<NavItem> = [
   { label: "Shops", href: "/shops", icon: Store },
   { label: "ICP", href: "/icp", icon: Target },
+  { label: "Performance", href: "/performance", icon: TrendingUp },
 ];
 
 export const Sidebar = () => {
