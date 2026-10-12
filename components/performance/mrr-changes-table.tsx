@@ -14,6 +14,8 @@ type MrrChangesTablePoint = {
   periodKey: string;
   newMrr: number;
   expansionMrr: number;
+  reactivationMrr: number;
+  contractionMrr: number;
   churnedMrr: number;
   netChangeMrr: number;
 };
@@ -38,6 +40,16 @@ const ROWS: Array<RowSpec> = [
     label: "Expansion",
     getValue: (point) => point.expansionMrr,
     signed: false,
+  },
+  {
+    label: "Reactivation",
+    getValue: (point) => point.reactivationMrr,
+    signed: false,
+  },
+  {
+    label: "Contraction",
+    getValue: (point) => -point.contractionMrr,
+    signed: true,
   },
   {
     label: "Churn",

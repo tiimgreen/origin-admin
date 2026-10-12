@@ -99,6 +99,13 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
   const first = periods[0];
   const last = periods[periods.length - 1];
 
+  // The headline compares the range endpoints; each chart point compares
+  // itself to its predecessor. Zero opening MRR reports 0% growth.
+  const rangeGrowthRate =
+    first && last && first.totalMrr > 0
+      ? (last.totalMrr - first.totalMrr) / first.totalMrr
+      : 0;
+
   const topPlanMrr = (period: PerformancePeriod | undefined) => {
     if (!period) {
       return 0;
@@ -152,15 +159,12 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
 
         <ChartCard
           title="MRR growth rate"
-          value={(() => {
-            const rate = lastNonNull(periods.map((period) => period.growthRate));
-            return rate !== null ? formatPercent(rate, 2) : "—";
-          })()}
+          value={formatPercent(rangeGrowthRate, 2)}
           delta={percentPointDelta({
-            current: lastNonNull(periods.map((period) => period.growthRate)),
-            previous: firstNonNull(periods.map((period) => period.growthRate)),
+            current: last?.growthRate ?? null,
+            previous: first?.growthRate ?? null,
           })}
-          hint={rangeLabel}
+          hint={`${rangeLabel} · chart is point over previous point`}
         >
           <MetricTrendChart
             data={periods.map((period) => {
@@ -234,7 +238,7 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
             current: lastNonNull(periods.map((period) => period.ltv)) ?? 0,
             previous: firstNonNull(periods.map((period) => period.ltv)) ?? 0,
           })}
-          hint={`${rangeLabel} · ARPU ÷ customer churn rate`}
+          hint={`${rangeLabel} · ARPU ÷ rolling 30d subscription churn`}
         >
           <MetricTrendChart
             data={periods.map((period) => {
@@ -247,24 +251,23 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
       </div>
 
       <ChartCard
-        title="Net churn rate"
+        title="Revenue churn"
         value={(() => {
-          const rate = lastNonNull(periods.map((period) => period.netChurnRate));
+          const rate = lastNonNull(periods.map((period) => period.revenueChurnRate));
           return rate !== null ? formatPercent(rate, 2) : "—";
         })()}
         delta={percentPointDelta({
-          current: lastNonNull(periods.map((period) => period.netChurnRate)),
-          previous: firstNonNull(periods.map((period) => period.netChurnRate)),
+          current: lastNonNull(periods.map((period) => period.revenueChurnRate)),
+          previous: firstNonNull(periods.map((period) => period.revenueChurnRate)),
         })}
-        hint={rangeLabel}
+        hint={`${rangeLabel} · rolling 30d churned MRR ÷ opening MRR`}
       >
         <MetricTrendChart
           data={periods.map((period) => {
-            return { periodKey: period.periodKey, value: period.netChurnRate };
+            return { periodKey: period.periodKey, value: period.revenueChurnRate };
           })}
-          name="Net churn rate"
+          name="Revenue churn"
           valueFormat="percent"
-          showTrend={false}
         />
       </ChartCard>
 
@@ -279,7 +282,7 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
             periods.reduce((sum, period) => sum + period.netChangeMrr, 0),
           ),
         }}
-        hint="New vs expansion vs churned MRR"
+        hint="New, expansion, reactivation vs contraction, churn"
       >
         <div className="space-y-6">
           <MrrChangesChart
@@ -288,6 +291,8 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
                 periodKey: period.periodKey,
                 newMrr: period.newMrr,
                 expansionMrr: period.expansionMrr,
+                reactivationMrr: period.reactivationMrr,
+                contractionMrr: period.contractionMrr,
                 churnedMrr: period.churnedMrr,
                 netChangeMrr: period.netChangeMrr,
               };
@@ -299,6 +304,8 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
                 periodKey: period.periodKey,
                 newMrr: period.newMrr,
                 expansionMrr: period.expansionMrr,
+                reactivationMrr: period.reactivationMrr,
+                contractionMrr: period.contractionMrr,
                 churnedMrr: period.churnedMrr,
                 netChangeMrr: period.netChangeMrr,
               };
@@ -317,13 +324,13 @@ const PerformanceBoard = async ({ range }: { range: PerformanceRange }) => {
           current: lastNonNull(periods.map((period) => period.maxMrr)) ?? 0,
           previous: firstNonNull(periods.map((period) => period.maxMrr)) ?? 0,
         })}
-        hint={`${rangeLabel} · (new + expansion MRR) ÷ cancellation rate`}
+        hint={`${rangeLabel} · (new + expansion + reactivation MRR) ÷ cancellation rate`}
       >
         <MaxMrrChart
           data={periods.map((period) => {
             return {
               periodKey: period.periodKey,
-              mrr: period.convertedMrr,
+              mrr: period.subscriptionMrr,
               maxMrr: period.maxMrr,
             };
           })}
@@ -377,8 +384,14 @@ const PerformancePage = async ({ searchParams }: PerformancePageProps) => {
     <div className="mx-auto max-w-7xl space-y-6">
       <PageHeader
         title="Performance"
-        description="MRR, growth and retention computed from Shopify Partners API payouts. First load after a deploy may take a while to sync."
-        actions={<RangeSelect value={range} />}
+        description="MRR, growth and retention reconstructed from Shopify Partners API subscription events and usage payouts. First load after a deploy may take a while to sync."
+        actions={
+          <RangeSelect
+            value={range}
+            options={PERFORMANCE_RANGES}
+            basePath="/performance"
+          />
+        }
       />
 
       <Suspense key={range} fallback={<PerformanceSkeleton />}>

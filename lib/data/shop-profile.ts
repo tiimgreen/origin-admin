@@ -5,7 +5,8 @@ import { supabase } from "@/lib/supabase";
 import { toUsd } from "./currencies";
 import { monthKey } from "./dates";
 
-const MONTH_MS = 86_400_000 * 30.4375;
+const DAY_MS = 86_400_000;
+const BILLING_PERIOD_MS = DAY_MS * 30;
 
 export type ShopCurrentPlan = {
   subscriptionId: number;
@@ -28,8 +29,8 @@ export type ShopDetail = {
   vertical: string | null;
   currentPlan: ShopCurrentPlan | null;
   firstPaidAt: string | null;
-  // Estimated lifetime subscription revenue: months active × monthly price,
-  // summed across every paid subscription the shop has held.
+  // Estimated lifetime subscription revenue: payments collected × monthly
+  // price, summed across every paid subscription the shop has held.
   ltv: number;
 };
 
@@ -56,8 +57,13 @@ type RawSubscription = {
   activated_at: string | null;
   deactivated_at: string | null;
   current_period_end: string | null;
+  trial_days: number;
 };
 
+// Shopify charges the full price at the start of every 30-day billing period
+// (the first one once any trial ends), so a subscription is worth the number
+// of periods it has started × monthly price. Cancelling mid-period does not
+// refund the period already paid for.
 export const estimateLtv = (subscriptions: Array<RawSubscription>): number => {
   let total = 0;
 
@@ -67,14 +73,19 @@ export const estimateLtv = (subscriptions: Array<RawSubscription>): number => {
       continue;
     }
 
-    const startMs = new Date(sub.activated_at).getTime();
+    const billingStartMs =
+      new Date(sub.activated_at).getTime() + sub.trial_days * DAY_MS;
     const endIso =
       sub.deactivated_at ??
       (sub.status === "CANCELLED" ? sub.current_period_end : null);
     const endMs = endIso ? new Date(endIso).getTime() : Date.now();
 
-    const months = Math.max(0, (endMs - startMs) / MONTH_MS);
-    total += price * months;
+    if (endMs <= billingStartMs) {
+      continue;
+    }
+
+    const payments = Math.ceil((endMs - billingStartMs) / BILLING_PERIOD_MS);
+    total += price * payments;
   }
 
   return total;
@@ -109,7 +120,8 @@ export const getShopDetail = cache(
         status,
         activated_at,
         deactivated_at,
-        current_period_end
+        current_period_end,
+        trial_days
       `)
       .eq("shop", shop);
 

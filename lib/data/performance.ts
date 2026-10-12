@@ -29,15 +29,13 @@ const SYNC_OVERLAP_MS = 2 * 24 * 60 * 60 * 1000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// A shop counts as subscribed at a point in time if it was billed within the
-// trailing window (35 days absorbs 30-day billing cycle drift) and its charge
-// has not been canceled or frozen since.
-const MONTHLY_LOOKBACK_MS = 35 * DAY_MS;
-const ANNUAL_LOOKBACK_MS = 370 * DAY_MS;
-
 // Usage revenue is a trailing window rather than a calendar-month sum so the
 // current (partial) month isn't understated.
 const USAGE_LOOKBACK_MS = 30 * DAY_MS;
+
+// Every churn point is a rolling rate: movements since the opening snapshot
+// 30 days earlier, over the population at that opening snapshot.
+const CHURN_WINDOW_MS = 30 * DAY_MS;
 
 // When a merchant switches plan, Shopify cancels the old charge and activates
 // the new one within about a second of each other, in either order. A gap
@@ -45,8 +43,9 @@ const USAGE_LOOKBACK_MS = 30 * DAY_MS;
 const PLAN_SWITCH_GRACE_MS = 60 * 1000;
 
 // One point per period: a calendar month ("2026-09") or, for the 30-day
-// range, a calendar day ("2026-09-15"). Rates (growth, churn, LTV, max MRR)
-// are computed over the period, so daily points are far noisier.
+// range, a calendar day ("2026-09-15"). Levels, growth and churn are
+// point-in-time values at the period end (or now); MRR movements and max MRR
+// are summed over the period.
 export type PerformancePeriod = {
   periodKey: string;
   subscriptionMrr: number;
@@ -54,16 +53,17 @@ export type PerformancePeriod = {
   trialMrr: number;
   totalMrr: number;
   arr: number;
-  growthRate: number | null;
+  growthRate: number;
   activeSubscriptions: number;
   arpu: number;
   ltv: number | null;
-  netChurnRate: number | null;
+  revenueChurnRate: number | null;
   newMrr: number;
   expansionMrr: number;
+  reactivationMrr: number;
+  contractionMrr: number;
   churnedMrr: number;
   netChangeMrr: number;
-  convertedMrr: number;
   maxMrr: number | null;
   planMrr: Record<string, number>;
 };
@@ -270,9 +270,36 @@ const loadPartnersRows = async ({ now }: { now: Date }) => {
   return { transactions, events };
 };
 
-type ShopSnapshotEntry = {
+// A shop's recurring value from `atMs` until its next state change. Amount is
+// the monthly equivalent, and 0 once the shop has churned.
+type ShopState = {
+  atMs: number;
   amount: number;
-  chargeId: string | null;
+  planName: string | null;
+};
+
+type MrrFlows = {
+  newMrr: number;
+  expansionMrr: number;
+  reactivationMrr: number;
+  contractionMrr: number;
+  churnedMrr: number;
+};
+
+type FlowEvent = {
+  atMs: number;
+  flow: keyof MrrFlows;
+  amount: number;
+};
+
+const emptyFlows = (): MrrFlows => {
+  return {
+    newMrr: 0,
+    expansionMrr: 0,
+    reactivationMrr: 0,
+    contractionMrr: 0,
+    churnedMrr: 0,
+  };
 };
 
 const periodKeyOf = ({ date, granularity }: { date: Date; granularity: Granularity }) => {
@@ -313,29 +340,9 @@ export const computeMetrics = ({
 
   const validEvents = events.filter((event) => !event.test);
 
-  // Most recent activation event per charge: names the plan and, via
-  // billing_on (the first billing date), marks when its trial ends.
-  const activationByChargeId = new Map<string, EventRow>();
-  for (const event of validEvents) {
-    if (event.type === "SUBSCRIPTION_CHARGE_ACTIVATED") {
-      activationByChargeId.set(event.charge_id, event);
-    }
-  }
-
-  const planNameByChargeId = new Map<string, string>();
-  for (const [chargeId, activation] of activationByChargeId) {
-    planNameByChargeId.set(chargeId, activation.charge_name);
-  }
-
-  // A charge without a billing_on has no trial: it is billable from activation.
-  const trialEndMs = (activation: EventRow) => {
-    return activation.billing_on
-      ? new Date(activation.billing_on).getTime()
-      : new Date(activation.occurred_at).getTime();
-  };
-
-  const subscriptionSalesByShop = new Map<string, Array<TransactionRow>>();
-  const billedChargeFirstSaleMs = new Map<string, number>();
+  // Lifecycle events don't carry the billing interval, so annual charges are
+  // recognised by their sales. Their amount is spread across 12 months.
+  const annualChargeIds = new Set<string>();
   const usageSales: Array<{ createdAtMs: number; amount: number }> = [];
 
   for (const transaction of validTransactions) {
@@ -347,64 +354,28 @@ export const computeMetrics = ({
       continue;
     }
 
-    const sales = subscriptionSalesByShop.get(transaction.shop_domain) ?? [];
-    sales.push(transaction);
-    subscriptionSalesByShop.set(transaction.shop_domain, sales);
-
-    if (transaction.charge_id) {
-      const createdAtMs = new Date(transaction.created_at).getTime();
-      const existing = billedChargeFirstSaleMs.get(transaction.charge_id);
-      if (existing === undefined || createdAtMs < existing) {
-        billedChargeFirstSaleMs.set(transaction.charge_id, createdAtMs);
-      }
+    if (transaction.charge_id && transaction.billing_interval === "ANNUAL") {
+      annualChargeIds.add(transaction.charge_id);
     }
   }
 
-  for (const sales of subscriptionSalesByShop.values()) {
-    sales.sort((a, b) => a.created_at.localeCompare(b.created_at));
-  }
-
-  // Charge lifecycle, so canceled/frozen charges stop counting immediately
-  // instead of lingering until their last sale ages out of the trailing
-  // window. Events are ordered by occurred_at; the latest state at a point in
-  // time wins (an UNFROZEN event revives a frozen charge).
-  const eventsByChargeId = new Map<string, Array<EventRow>>();
-  for (const event of validEvents) {
-    const chargeEvents = eventsByChargeId.get(event.charge_id) ?? [];
-    chargeEvents.push(event);
-    eventsByChargeId.set(event.charge_id, chargeEvents);
-  }
-
-  const chargeEndedBy = ({ chargeId, atMs }: { chargeId: string; atMs: number }) => {
-    const chargeEvents = eventsByChargeId.get(chargeId);
-    if (!chargeEvents) {
-      return false;
-    }
-
-    let lastState: string | null = null;
-    for (const event of chargeEvents) {
-      if (new Date(event.occurred_at).getTime() > atMs) {
-        break;
-      }
-      lastState = event.type;
-    }
-
-    return (
-      lastState === "SUBSCRIPTION_CHARGE_CANCELED" ||
-      lastState === "SUBSCRIPTION_CHARGE_FROZEN"
-    );
+  const monthlyAmount = (charge: EventRow) => {
+    return annualChargeIds.has(charge.charge_id)
+      ? charge.charge_amount / 12
+      : charge.charge_amount;
   };
 
-  // MRR changes are driven by charge lifecycle events. A charge only counts
+  // MRR is reconstructed from charge lifecycle events. A charge only counts
   // once its trial has ended (billing_on) and it is still active, so a shop's
-  // MRR is the amount of its converted, uncancelled, unfrozen charge, and the
-  // flows below always sum to the change in that figure.
+  // MRR is the monthly amount of its converted, uncancelled, unfrozen charge.
+  // Every change to that figure is recorded as a movement, so the movements
+  // always sum to the change in MRR.
   //
-  // New MRR lands in the month a shop's first ever charge converts. A plan
-  // switch during the trial only changes which plan converts; a switch after
+  // New MRR lands when a shop's first ever charge converts. A plan switch
+  // during the trial only changes which plan converts; a switch after
   // conversion is expansion or contraction. Cancelling or freezing a
   // converted charge is churn. A shop that converts again after churning, or
-  // is unfrozen, is a reactivation, reported under expansion.
+  // is unfrozen, is a reactivation.
   //
   // Closed shops come back from the Partners API as "REDACTED", so each of
   // their charges has to be treated as its own shop.
@@ -419,23 +390,12 @@ export const computeMetrics = ({
     eventsByShop.set(shopKey, shopEvents);
   }
 
-  type MrrFlows = { newMrr: number; expansionMrr: number; churnedMrr: number };
-  const flowsByPeriod = new Map<string, MrrFlows>();
+  const flowEvents: Array<FlowEvent> = [];
+  const timelines: Array<Array<ShopState>> = [];
 
-  const addFlow = ({
-    atMs,
-    flow,
-    amount,
-  }: {
-    atMs: number;
-    flow: keyof MrrFlows;
-    amount: number;
-  }) => {
-    const key = periodKeyOf({ date: new Date(atMs), granularity });
-    const flows = flowsByPeriod.get(key) ?? { newMrr: 0, expansionMrr: 0, churnedMrr: 0 };
-    flows[flow] += amount;
-    flowsByPeriod.set(key, flows);
-  };
+  // Trials that are still running today. They are not MRR, but the MRR chart
+  // shows them as their own band from the day they started.
+  const activeTrials: Array<{ activatedAtMs: number; amount: number }> = [];
 
   const conversionMs = (charge: EventRow) => {
     const activatedAtMs = new Date(charge.occurred_at).getTime();
@@ -445,22 +405,33 @@ export const computeMetrics = ({
   };
 
   for (const shopEvents of eventsByShop.values()) {
+    const timeline: Array<ShopState> = [];
+
     // The charge still in trial, and the converted charge. Never both.
     let pending: EventRow | null = null;
     let live: EventRow | null = null;
     let hasConverted = false;
+
+    const recordState = ({ atMs, charge }: { atMs: number; charge: EventRow | null }) => {
+      timeline.push({
+        atMs,
+        amount: charge ? monthlyAmount(charge) : 0,
+        planName: charge ? charge.charge_name : null,
+      });
+    };
 
     const convertPendingBy = (atMs: number) => {
       if (!pending || conversionMs(pending) > atMs) {
         return;
       }
 
-      addFlow({
+      flowEvents.push({
         atMs: conversionMs(pending),
-        flow: hasConverted ? "expansionMrr" : "newMrr",
-        amount: pending.charge_amount,
+        flow: hasConverted ? "reactivationMrr" : "newMrr",
+        amount: monthlyAmount(pending),
       });
       live = pending;
+      recordState({ atMs: conversionMs(pending), charge: pending });
       pending = null;
       hasConverted = true;
     };
@@ -472,13 +443,14 @@ export const computeMetrics = ({
       if (event.type === "SUBSCRIPTION_CHARGE_ACTIVATED") {
         if (live) {
           // Plan switch on a converted charge takes effect immediately.
-          const delta = event.charge_amount - live.charge_amount;
+          const delta = monthlyAmount(event) - monthlyAmount(live);
           if (delta > 0) {
-            addFlow({ atMs: occurredAtMs, flow: "expansionMrr", amount: delta });
+            flowEvents.push({ atMs: occurredAtMs, flow: "expansionMrr", amount: delta });
           } else if (delta < 0) {
-            addFlow({ atMs: occurredAtMs, flow: "churnedMrr", amount: -delta });
+            flowEvents.push({ atMs: occurredAtMs, flow: "contractionMrr", amount: -delta });
           }
           live = event;
+          recordState({ atMs: occurredAtMs, charge: event });
         } else {
           pending = event;
         }
@@ -514,12 +486,85 @@ export const computeMetrics = ({
         continue;
       }
 
-      addFlow({ atMs: occurredAtMs, flow: "churnedMrr", amount: live.charge_amount });
+      flowEvents.push({ atMs: occurredAtMs, flow: "churnedMrr", amount: monthlyAmount(live) });
       live = null;
+      recordState({ atMs: occurredAtMs, charge: null });
     }
 
     convertPendingBy(now.getTime());
+    timelines.push(timeline);
+
+    if (pending) {
+      activeTrials.push({
+        activatedAtMs: new Date(pending.occurred_at).getTime(),
+        amount: monthlyAmount(pending),
+      });
+    }
   }
+
+  // Point-in-time population: every shop with a positive recurring amount.
+  const snapshotAt = (atMs: number) => {
+    let mrr = 0;
+    let paidSubscriptions = 0;
+    const planMrr: Record<string, number> = {};
+
+    for (const timeline of timelines) {
+      let state: ShopState | null = null;
+      for (const entry of timeline) {
+        if (entry.atMs > atMs) {
+          break;
+        }
+        state = entry;
+      }
+
+      if (!state || state.amount <= 0) {
+        continue;
+      }
+
+      mrr += state.amount;
+      paidSubscriptions += 1;
+
+      const planName = state.planName ?? "Unknown";
+      planMrr[planName] = (planMrr[planName] ?? 0) + state.amount;
+    }
+
+    return { mrr, paidSubscriptions, planMrr };
+  };
+
+  // Movements after an opening snapshot, up to and including a report point.
+  const movementsBetween = ({ fromMs, toMs }: { fromMs: number; toMs: number }) => {
+    const flows = emptyFlows();
+    let lostSubscriptions = 0;
+
+    for (const event of flowEvents) {
+      if (event.atMs <= fromMs || event.atMs > toMs) {
+        continue;
+      }
+
+      flows[event.flow] += event.amount;
+      if (event.flow === "churnedMrr" && event.amount > 0) {
+        lostSubscriptions += 1;
+      }
+    }
+
+    return { flows, lostSubscriptions };
+  };
+
+  const flowsByPeriod = new Map<string, MrrFlows>();
+  for (const event of flowEvents) {
+    const key = periodKeyOf({ date: new Date(event.atMs), granularity });
+    const flows = flowsByPeriod.get(key) ?? emptyFlows();
+    flows[event.flow] += event.amount;
+    flowsByPeriod.set(key, flows);
+  }
+
+  const usageMrrAt = (atMs: number) => {
+    return usageSales.reduce((sum, sale) => {
+      const inWindow =
+        sale.createdAtMs <= atMs && sale.createdAtMs > atMs - USAGE_LOOKBACK_MS;
+      return inWindow ? sum + sale.amount : sum;
+    }, 0);
+  };
 
   // The display periods plus one before them for period-over-period deltas.
   const internalKeys: Array<string> = [];
@@ -531,208 +576,61 @@ export const computeMetrics = ({
     internalKeys.push(periodKeyOf({ date, granularity }));
   }
 
-  // Point-in-time per shop MRR snapshots at each period end (or now, for the
-  // current period): the shop's latest subscription sale within the trailing
-  // billing window, annual amounts spread across 12 months.
-  const snapshots: Array<Map<string, ShopSnapshotEntry>> = internalKeys.map((key) => {
-    const snapshotAtMs = Math.min(periodEndMs(key), now.getTime());
-
-    const snapshot = new Map<string, ShopSnapshotEntry>();
-
-    for (const [shopDomain, sales] of subscriptionSalesByShop) {
-      let latest: TransactionRow | null = null;
-
-      for (const sale of sales) {
-        const createdAtMs = new Date(sale.created_at).getTime();
-        if (createdAtMs > snapshotAtMs) {
-          break;
-        }
-
-        const lookbackMs =
-          sale.billing_interval === "ANNUAL" ? ANNUAL_LOOKBACK_MS : MONTHLY_LOOKBACK_MS;
-
-        if (createdAtMs > snapshotAtMs - lookbackMs) {
-          latest = sale;
-        }
-      }
-
-      if (!latest) {
-        continue;
-      }
-
-      if (
-        latest.charge_id &&
-        chargeEndedBy({ chargeId: latest.charge_id, atMs: snapshotAtMs })
-      ) {
-        continue;
-      }
-
-      snapshot.set(shopDomain, {
-        amount:
-          latest.billing_interval === "ANNUAL"
-            ? latest.gross_amount / 12
-            : latest.gross_amount,
-        chargeId: latest.charge_id,
-      });
-    }
-
-    // Charges whose trial has ended but whose first sale hasn't been reported
-    // yet are real MRR from the trial end date, as long as they are still
-    // active. If no sale ever lands within the billing window, the charge is
-    // stale and drops out.
-    for (const activation of activationByChargeId.values()) {
-      const endMs = trialEndMs(activation);
-      if (endMs > snapshotAtMs || snapshotAtMs - endMs > MONTHLY_LOOKBACK_MS) {
-        continue;
-      }
-
-      const firstSaleMs = billedChargeFirstSaleMs.get(activation.charge_id);
-      if (firstSaleMs !== undefined && firstSaleMs <= snapshotAtMs) {
-        continue;
-      }
-
-      if (
-        chargeEndedBy({ chargeId: activation.charge_id, atMs: snapshotAtMs }) ||
-        snapshot.has(activation.shop_domain)
-      ) {
-        continue;
-      }
-
-      snapshot.set(activation.shop_domain, {
-        amount: activation.charge_amount,
-        chargeId: activation.charge_id,
-      });
-    }
-
-    return snapshot;
-  });
-
-  // Only trials that are active today count as trial MRR. A trial that has
-  // since ended is either real MRR from its end date (handled in the
-  // snapshots above) or nothing, so historical months never show it.
-  const activeTrials = Array.from(activationByChargeId.values()).filter((activation) => {
-    return (
-      trialEndMs(activation) > now.getTime() &&
-      !billedChargeFirstSaleMs.has(activation.charge_id) &&
-      !chargeEndedBy({ chargeId: activation.charge_id, atMs: now.getTime() })
-    );
-  });
-
-  const trialMrrByIndex = internalKeys.map((key, index) => {
-    const snapshotAtMs = Math.min(periodEndMs(key), now.getTime());
-    const snapshot = snapshots[index];
-
-    const trialShops = new Set<string>();
-    let trialMrr = 0;
-
-    for (const activation of activeTrials) {
-      if (
-        new Date(activation.occurred_at).getTime() > snapshotAtMs ||
-        snapshot.has(activation.shop_domain) ||
-        trialShops.has(activation.shop_domain)
-      ) {
-        continue;
-      }
-
-      trialShops.add(activation.shop_domain);
-      trialMrr += activation.charge_amount;
-    }
-
-    return trialMrr;
-  });
-
-  // Every change to converted MRR is recorded as a flow, so its level at any
-  // period end is the running sum of flows up to then.
-  const netOf = (flows: MrrFlows) => {
-    return flows.newMrr + flows.expansionMrr - flows.churnedMrr;
+  // Each period is reported at its end, or now for the current period.
+  const pointMs = (key: string) => {
+    return Math.min(periodEndMs(key), now.getTime());
   };
 
-  let convertedMrr = 0;
-  for (const [key, flows] of flowsByPeriod) {
-    if (key <= internalKeys[0]) {
-      convertedMrr += netOf(flows);
-    }
-  }
+  const snapshots = internalKeys.map((key) => snapshotAt(pointMs(key)));
 
   const periods: Array<PerformancePeriod> = [];
-  let previousTotalMrr: number | null = null;
 
   for (let index = 1; index < internalKeys.length; index++) {
     const key = internalKeys[index];
+    const atMs = pointMs(key);
     const snapshot = snapshots[index];
     const previousSnapshot = snapshots[index - 1];
 
-    let subscriptionMrr = 0;
-    const planMrr: Record<string, number> = {};
+    const subscriptionMrr = snapshot.mrr;
+    const usageMrr = usageMrrAt(atMs);
+    const totalMrr = subscriptionMrr + usageMrr;
 
-    for (const entry of snapshot.values()) {
-      subscriptionMrr += entry.amount;
-      const planName =
-        (entry.chargeId ? planNameByChargeId.get(entry.chargeId) : undefined) ??
-        "Unknown";
-      planMrr[planName] = (planMrr[planName] ?? 0) + entry.amount;
-    }
-
-    const snapshotAtMs = Math.min(periodEndMs(key), now.getTime());
-
-    const usageMrr = usageSales.reduce((sum, sale) => {
-      const inWindow =
-        sale.createdAtMs <= snapshotAtMs &&
-        sale.createdAtMs > snapshotAtMs - USAGE_LOOKBACK_MS;
-      return inWindow ? sum + sale.amount : sum;
+    const trialMrr = activeTrials.reduce((sum, trial) => {
+      return trial.activatedAtMs <= atMs ? sum + trial.amount : sum;
     }, 0);
-    const trialMrr = trialMrrByIndex[index];
-    const totalMrr = subscriptionMrr + usageMrr + trialMrr;
 
-    const flows = flowsByPeriod.get(key) ?? { newMrr: 0, expansionMrr: 0, churnedMrr: 0 };
-    const { newMrr, expansionMrr, churnedMrr } = flows;
+    const previousTotalMrr =
+      previousSnapshot.mrr + usageMrrAt(pointMs(internalKeys[index - 1]));
+    const growthRate =
+      previousTotalMrr > 0 ? (totalMrr - previousTotalMrr) / previousTotalMrr : 0;
 
-    // Max MRR (https://longform.asmartbear.com/max-mrr/): the level at which
-    // churn dollars catch up with new dollars, given this period's rates.
-    const startOfPeriodMrr = convertedMrr;
-    convertedMrr += netOf(flows);
-    const cancellationRate = startOfPeriodMrr > 0 ? churnedMrr / startOfPeriodMrr : null;
+    // Rolling 30-day churn: revenue lost (cancellations and freezes) relative
+    // to opening MRR, and subscriptions lost relative to opening subscriptions.
+    const openingMs = atMs - CHURN_WINDOW_MS;
+    const opening = snapshotAt(openingMs);
+    const rolling = movementsBetween({ fromMs: openingMs, toMs: atMs });
 
-    // Snapshot-to-snapshot movement of billed MRR, which the churn rate and
-    // LTV are still based on.
-    let snapshotExpansionMrr = 0;
-    let snapshotChurnedMrr = 0;
-    let churnedShops = 0;
+    const revenueChurnRate =
+      opening.mrr > 0 ? rolling.flows.churnedMrr / opening.mrr : null;
+    const subscriptionChurnRate =
+      opening.paidSubscriptions > 0
+        ? rolling.lostSubscriptions / opening.paidSubscriptions
+        : null;
 
-    for (const [shopDomain, entry] of snapshot) {
-      const previous = previousSnapshot.get(shopDomain);
-      if (!previous) {
-        continue;
-      }
-
-      if (entry.amount > previous.amount) {
-        snapshotExpansionMrr += entry.amount - previous.amount;
-      } else if (entry.amount < previous.amount) {
-        snapshotChurnedMrr += previous.amount - entry.amount;
-      }
-    }
-
-    for (const [shopDomain, previous] of previousSnapshot) {
-      if (!snapshot.has(shopDomain)) {
-        snapshotChurnedMrr += previous.amount;
-        churnedShops += 1;
-      }
-    }
-
-    const previousSubscriptionMrr = Array.from(previousSnapshot.values()).reduce(
-      (sum, entry) => sum + entry.amount,
-      0,
-    );
-
-    const activeSubscriptions = snapshot.size;
+    const activeSubscriptions = snapshot.paidSubscriptions;
     const arpu = activeSubscriptions > 0 ? subscriptionMrr / activeSubscriptions : 0;
 
-    const customerChurnRate =
-      previousSnapshot.size > 0 ? churnedShops / previousSnapshot.size : null;
+    const flows = flowsByPeriod.get(key) ?? emptyFlows();
+    const { newMrr, expansionMrr, reactivationMrr, contractionMrr, churnedMrr } = flows;
+    const inflowMrr = newMrr + expansionMrr + reactivationMrr;
+    const outflowMrr = contractionMrr + churnedMrr;
 
-    // Flow-derived rates only cover part of the current period, which would
-    // understate churn (and so overstate LTV); leave them undefined until the
-    // period completes. Point-in-time values (MRR, ARR, ARPU) stay valid.
+    // Max MRR (https://longform.asmartbear.com/max-mrr/): the level at which
+    // lost dollars catch up with added dollars, given this period's rates.
+    // Period movements only cover part of the current period, so it is left
+    // undefined until the period completes.
+    const startOfPeriodMrr = previousSnapshot.mrr;
+    const cancellationRate = startOfPeriodMrr > 0 ? outflowMrr / startOfPeriodMrr : null;
     const isPartialPeriod = now.getTime() < periodEndMs(key);
 
     periods.push({
@@ -742,33 +640,26 @@ export const computeMetrics = ({
       trialMrr,
       totalMrr,
       arr: totalMrr * 12,
-      growthRate:
-        !isPartialPeriod && previousTotalMrr !== null && previousTotalMrr > 0
-          ? totalMrr / previousTotalMrr - 1
-          : null,
+      growthRate,
       activeSubscriptions,
       arpu,
       ltv:
-        !isPartialPeriod && customerChurnRate !== null && customerChurnRate > 0
-          ? arpu / customerChurnRate
+        subscriptionChurnRate !== null && subscriptionChurnRate > 0
+          ? arpu / subscriptionChurnRate
           : null,
-      netChurnRate:
-        !isPartialPeriod && previousSubscriptionMrr > 0
-          ? (snapshotChurnedMrr - snapshotExpansionMrr) / previousSubscriptionMrr
-          : null,
+      revenueChurnRate,
       newMrr,
       expansionMrr,
+      reactivationMrr,
+      contractionMrr,
       churnedMrr,
-      netChangeMrr: newMrr + expansionMrr - churnedMrr,
-      convertedMrr,
+      netChangeMrr: inflowMrr - outflowMrr,
       maxMrr:
         !isPartialPeriod && cancellationRate !== null && cancellationRate > 0
-          ? (newMrr + expansionMrr) / cancellationRate
+          ? inflowMrr / cancellationRate
           : null,
-      planMrr,
+      planMrr: snapshot.planMrr,
     });
-
-    previousTotalMrr = totalMrr;
   }
 
   const first = periods[0];

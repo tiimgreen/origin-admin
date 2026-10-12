@@ -146,7 +146,7 @@ export const MrrChart = ({ data }: MrrChartProps) => {
         />
         <Bar
           dataKey="trialMrr"
-          name="Trials"
+          name="Active trials"
           stackId="mrr"
           fill="var(--color-chart-3)"
           stroke="var(--color-card)"

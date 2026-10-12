@@ -127,6 +127,7 @@ type RawSubscription = {
   activated_at: string | null;
   deactivated_at: string | null;
   current_period_end: string | null;
+  trial_days: number;
 };
 
 const fetchAllSubscriptions = async (): Promise<Array<RawSubscription>> => {
@@ -145,7 +146,8 @@ const fetchAllSubscriptions = async (): Promise<Array<RawSubscription>> => {
         status,
         activated_at,
         deactivated_at,
-        current_period_end
+        current_period_end,
+        trial_days
       `)
       .order("id", { ascending: true })
       .range(from, from + PAGE_SIZE - 1);

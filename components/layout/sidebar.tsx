@@ -2,7 +2,15 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Activity, BarChart3, Store, Target, TrendingUp } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  Gauge,
+  MousePointerClick,
+  Store,
+  Target,
+  TrendingUp,
+} from "lucide-react";
 
 import { cn } from "@/lib/utils";
 
@@ -16,6 +24,8 @@ const NAV_ITEMS: Array<NavItem> = [
   { label: "Shops", href: "/shops", icon: Store },
   { label: "ICP", href: "/icp", icon: Target },
   { label: "Performance", href: "/performance", icon: TrendingUp },
+  { label: "Activity", href: "/activity", icon: MousePointerClick },
+  { label: "Monitoring", href: "/monitoring", icon: Gauge },
 ];
 
 export const Sidebar = () => {

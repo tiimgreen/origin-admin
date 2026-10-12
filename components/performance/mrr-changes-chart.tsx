@@ -20,6 +20,8 @@ export type MrrChangesPoint = {
   periodKey: string;
   newMrr: number;
   expansionMrr: number;
+  reactivationMrr: number;
+  contractionMrr: number;
   churnedMrr: number;
   netChangeMrr: number;
 };
@@ -79,6 +81,8 @@ export const MrrChangesChart = ({ data }: MrrChangesChartProps) => {
       periodKey: point.periodKey,
       newMrr: point.newMrr,
       expansionMrr: point.expansionMrr,
+      reactivationMrr: point.reactivationMrr,
+      contractionMrr: -point.contractionMrr,
       churnedMrr: -point.churnedMrr,
       netChangeMrr: point.netChangeMrr,
     };
@@ -149,7 +153,23 @@ export const MrrChangesChart = ({ data }: MrrChangesChartProps) => {
           fill="var(--color-chart-1)"
           stroke="var(--color-card)"
           strokeWidth={1}
+        />
+        <Bar
+          dataKey="reactivationMrr"
+          name="Reactivation"
+          stackId="change"
+          fill="var(--color-chart-5)"
+          stroke="var(--color-card)"
+          strokeWidth={1}
           radius={[3, 3, 0, 0]}
+        />
+        <Bar
+          dataKey="contractionMrr"
+          name="Contraction"
+          stackId="change"
+          fill="var(--color-chart-3)"
+          stroke="var(--color-card)"
+          strokeWidth={1}
         />
         <Bar
           dataKey="churnedMrr"
@@ -164,7 +184,7 @@ export const MrrChangesChart = ({ data }: MrrChangesChartProps) => {
           type="monotone"
           dataKey="netChangeMrr"
           name="Net change"
-          stroke="var(--color-chart-3)"
+          stroke="var(--color-foreground)"
           strokeWidth={2}
           dot={false}
         />

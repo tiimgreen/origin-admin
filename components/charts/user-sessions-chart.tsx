@@ -15,6 +15,7 @@ import type { DailySessionsPoint } from "@/lib/data/shop-users";
 
 type UserSessionsChartProps = {
   data: Array<DailySessionsPoint>;
+  height?: number;
 };
 
 type TooltipPayloadItem = {
@@ -49,9 +50,12 @@ const TooltipContent = ({
   );
 };
 
-export const UserSessionsChart = ({ data }: UserSessionsChartProps) => {
+export const UserSessionsChart = ({
+  data,
+  height = 160,
+}: UserSessionsChartProps) => {
   return (
-    <ResponsiveContainer width="100%" height={160}>
+    <ResponsiveContainer width="100%" height={height}>
       <BarChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
         <CartesianGrid
           strokeDasharray="3 3"
